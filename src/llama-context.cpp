@@ -1531,32 +1531,48 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    // decode 的输入只能二选一：
+    // 1. 直接提供 token id（token 非空，embd 为空）
+    // 2. 直接提供输入 embedding（embd 非空，token 为空）
+    // 两者同时提供、或者两者都为空，都属于调用方构造 batch 的错误。
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
+    // 某些 context 没有 decoder memory，此时不能走常规 decode 路径。
+    // 源码这里直接退回到 encode()，把这批输入当成编码任务处理。
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
     }
 
+    // 空 batch 没有任何可处理 token，直接返回非法输入。
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
 
+    // 取出后面频繁使用的模型只读视图，避免一直写 model.xxx。
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
+    // n_vocab: 词表大小，后面计算 logits buffer 大小和拷贝字节数时会用到。
+    // n_embd : 输入 embedding 维度，初始化 batch allocator 时会用到。
     const int64_t n_vocab = vocab.n_tokens();
     const int64_t n_embd  = hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
+    // 如果当前 context 配置为输出 embeddings，则必须把所有 token 都标记为输出。
+    // has_samplers 表示是否启用了 backend sampler，后面会影响 logits 的约束和拷贝逻辑。
     const bool output_all   = cparams.embeddings;
     const bool has_samplers = !sampling.samplers.empty();
 
+    // kv_unified 模式下，所有序列共享统一的 KV 空间，因此最大 seq_id 按全局上限处理；
+    // 否则使用 context 初始化时配置的 n_seq_max。
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
     // TODO: avoid this workaround in the future
     if (has_samplers && batch_inp.logits) {
+        // backend sampling 的当前实现要求：每个 sequence 在这一批里最多只能有一个输出 token。
+        // 这里按 seq_id 统计“被要求输出 logits 的 token 数”；如果超过 1，就直接报错。
         std::vector<int32_t> seq_output_count(n_seq_max, 0);
 
         for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
@@ -1579,16 +1595,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // batch allocator 负责把调用方传入的 llama_batch 规整成内部可消费的形式：
+    // 包括 token/embd 二选一输入、位置、seq_id、输出标记等。
+    // 失败通常意味着 batch 本身不合法或无法映射到当前 context/memory 约束。
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
 
+    // 规整后的总 token 数、总输出数。
+    // 注意二者不一定相等：例如只请求最后一个 token 输出时，n_outputs_all 可能远小于 n_tokens_all。
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     if (output_all) {
         // require that all tokens are output
+        // embeddings 模式要求每个 token 都能输出对应结果，否则 pooled / token embedding 都无法正确取回。
         if (n_outputs_all != n_tokens_all) {
             LLAMA_LOG_ERROR("%s: pooled embedding requires that all tokens are output (n_outputs_all = %d, n_tokens_all = %d)\n",
                     __func__, n_outputs_all, n_tokens_all);
@@ -1600,25 +1622,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    // 首次 decode 时记录计算起始时间，并累计本次排队的 token 数，供性能统计使用。
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
     n_queued_tokens += n_tokens_all;
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
+    // embd_seq: 保存按 sequence 聚合后的 embedding 输出
+    // output_swaps: 如果内部输出顺序和用户 batch 顺序不一致，后面会记录惰性交换信息
+    // 每次新 decode 前都要清空，避免上一次 batch 的残留状态污染本次结果。
     embd_seq.clear();
     output_swaps.clear();
 
+    // 确保 scheduler / graph reserve 处于可用状态。
     sched_reserve();
 
+    // 如果第一次准备 memory slot 失败，会尝试做一次 memory 优化后重试。
     bool did_optimize = false;
 
     // handle any pending shifts/copies
+    // 先把 memory 中待处理的 shift/copy 操作兑现，确保当前 KV / memory 状态是最新的。
     memory_update(false);
 
+    // mctx 描述“这次 batch 在 memory 中如何落位、如何按 ubatch 拆分”。
     llama_memory_context_ptr mctx;
 
     while (true) {
+        // 让 memory 模块为这次 batch 分配 / 准备好上下文。
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
         if (!mctx) {
             return -2;
@@ -1627,15 +1658,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
         switch (mctx->get_status()) {
             case LLAMA_MEMORY_STATUS_SUCCESS:
                 {
+                    // 已成功为当前 batch 准备好 memory，可以继续执行。
                 } break;
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
+                    // decode 路径预期会得到明确的成功或失败，而不是“无需更新”。
+                    // 这里把它视为异常状态处理。
                     LLAMA_LOG_ERROR("%s: unexpected memory context status: %d\n", __func__, mctx->get_status());
 
                     return -2;
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
                 {
+                    // memory slot 不够时，先尝试做一次 cache / memory 优化，再重试一次。
                     if (!did_optimize) {
                         did_optimize = true;
 
@@ -1646,12 +1681,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         }
                     }
 
+                    // 即使优化后仍然没有可用 slot，也不算致命错误；
+                    // 返回 1，调用方可以选择减小 batch 或增大 context 再试。
                     LLAMA_LOG_WARN("%s: failed to find a memory slot for batch of size %d\n", __func__, balloc->get_n_tokens());
 
                     return 1;
                 }
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
                 {
+                    // 准备 batch 的过程中就发生了底层计算失败，这属于内部错误。
                     LLAMA_LOG_ERROR("%s: compute failed while preparing batch of size %d\n", __func__, balloc->get_n_tokens());
 
                     return -2;
@@ -1662,18 +1700,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // reserve output buffer
+    // 提前为本批次所有输出预留 host 侧 buffer，后面每个 ubatch 会把结果异步拷回来。
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
 
+    // 记录在当前 batch 中，已经写入了多少个输出行。
+    // 每处理完一个 ubatch，就把本 ubatch 的输出追加到这个偏移之后。
     int64_t n_outputs_prev = 0;
 
     do {
+        // mctx 会把整批数据拆成一个个可执行的 ubatch，这里逐个处理。
         const auto & ubatch = mctx->get_ubatch();
 
         // count the outputs in this ubatch
         {
+            // n_outputs 表示“当前这个 ubatch 会产出多少行输出”。
+            // 它必须在建图之前算好，因为 graph 形状和输出张量大小依赖这个值。
             int32_t n_outputs_new = 0;
 
             if (n_outputs_all == n_tokens_all) {
@@ -1688,11 +1732,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
+        // 真正执行 decoder graph：
+        // 1. 基于 ubatch 组织图输入
+        // 2. 构图 / 复用图
+        // 3. 调 backend 执行
+        // 4. 返回图结果 res 以及底层 ggml_status
         ggml_status status;
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+            // 当前 ubatch 失败后，前面已经写入 memory 的一部分位置可能只写了一半。
+            // 为了避免留下“脏的 KV / memory 状态”，这里按每个 seq_id 找到本 ubatch 的最小 pos，
+            // 然后把 [pos_min, +inf) 这段统统删掉。
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
                 pos_min[s] = std::numeric_limits<llama_pos>::max();
@@ -1714,6 +1766,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 memory->seq_rm(s, pos_min[s], -1);
             }
 
+            // 把底层 ggml 执行状态映射成对外公开的 decode 返回码。
             switch (status) {
                 case GGML_STATUS_ABORTED:      return  2;
                 case GGML_STATUS_ALLOC_FAILED: return -2;
@@ -1735,11 +1788,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
+        // 只有在需要原始 logits 时才把它们拷回 host。
+        // 如果某个 sequence 完全由 backend sampler 消费，则不必额外拷 raw logits。
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
+            // 这次 ubatch 的 logits 结果写到整批输出缓冲区的 [n_outputs_prev, n_outputs_prev + n_outputs) 区间。
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
             if (n_outputs) {
@@ -1750,6 +1806,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
+        // embeddings 的回填方式取决于 pooling_type：
+        // - NONE:   每个输出 token 一条 embedding，写入 embd.data
+        // - MEAN/CLS/LAST/RANK: 按 sequence 聚合，写入 embd_seq[seq_id]
         if (embd.data && t_embd && n_outputs > 0) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
@@ -1810,6 +1869,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
+        // 如果启用了 backend sampler，除了 logits / embeddings 之外，
+        // 这里还会把 sampled token、probs、候选集合等调试/结果张量拷回 host。
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
             const auto stride = n_vocab;
@@ -1822,14 +1883,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
 
+        // 为下一个 ubatch 更新输出起始偏移。
         n_outputs_prev += n_outputs;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
+    // 循环结束后，把成员 n_outputs 设回“整批总输出数”，供外部查询接口使用。
     n_outputs = n_outputs_all;
 
     // set output mappings
     if (n_outputs > 0) {
+        // output_ids 把“用户 batch 中的输出索引”映射到“内部缓冲区中的实际行号”。
+        // 对于大多数因果模型，输出顺序通常天然有序；但某些模型 / memory 排布下，
+        // 内部执行顺序和用户给出的顺序可能不同，需要在这里建立重排信息。
         bool sorted_output = true;
 
         auto & out_ids = balloc->get_out_ids();
@@ -1850,6 +1916,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT((size_t) n_outputs == out_ids.size());
 
             // TODO: is there something more efficient which also minimizes swaps?
+            // 这里不是为了高性能排序，而是为了尽量少交换。
+            // output_swaps 不会立刻改动 logits/embd 缓冲，而是等外部真正访问时再懒应用。
             // selection sort, to minimize swaps (from https://en.wikipedia.org/wiki/Selection_sort)
             for (uint32_t i = 0; i < n_outputs - 1; ++i) {
                 uint32_t j_min = i;
@@ -1878,8 +1946,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    // 走到这里说明：
+    // - 所有 ubatch 都已成功执行
+    // - 输出缓冲和映射关系已经准备好
+    // - 若调用方随后读取 logits/embeddings，会在需要时触发同步
     return 0;
 }
+
 
 //
 // output

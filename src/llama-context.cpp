@@ -1531,9 +1531,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    // decode 的输入只能二选一：
-    // 1. 直接提供 token id（token 非空，embd 为空）
-    // 2. 直接提供输入 embedding（embd 非空，token 为空）
+    // decode 的输入只能二选一：token 或 embd
     // 两者同时提供、或者两者都为空，都属于调用方构造 batch 的错误。
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
@@ -1550,18 +1548,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
-    // 取出后面频繁使用的模型只读视图，避免一直写 model.xxx。
+    // 引用，避免一直写 model.xxx。
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
-    // n_vocab: 词表大小，后面计算 logits buffer 大小和拷贝字节数时会用到。
-    // n_embd : 输入 embedding 维度，初始化 batch allocator 时会用到。
+    // n_vocab：词表大小，后面计算 logits buffer 大小和拷贝字节数时会用到
+    // n_embd：输入 embedding 维度，初始化 batch allocator 时会用到
     const int64_t n_vocab = vocab.n_tokens();
     const int64_t n_embd  = hparams.n_embd_inp();
 
-    // when computing embeddings, all tokens are output
-    // 如果当前 context 配置为输出 embeddings，则必须把所有 token 都标记为输出。
-    // has_samplers 表示是否启用了 backend sampler，后面会影响 logits 的约束和拷贝逻辑。
+    // output_all：是否输出 embd，如果当前 context 配置 True，则必须把所有 token 都标记为输出
+    // has_samplers：std::map samplers 是否非空，即是否启用 backend sampler；
+    //               后面会影响 logits 的约束和拷贝逻辑
     const bool output_all   = cparams.embeddings;
     const bool has_samplers = !sampling.samplers.empty();
 
@@ -1570,6 +1568,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
     // TODO: avoid this workaround in the future
+    // 如果启用采样（std::map samplers 非空）且 logits 存在；
     if (has_samplers && batch_inp.logits) {
         // backend sampling 的当前实现要求：每个 sequence 在这一批里最多只能有一个输出 token。
         // 这里按 seq_id 统计“被要求输出 logits 的 token 数”；如果超过 1，就直接报错。
@@ -1579,7 +1578,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (batch_inp.logits[i] == 0) {
                 continue;
             }
-
+            
+            // ns 记录当前 batch 中第 i 个 token 属于几条 seq；
+            // 不传默认每个 token 属于 1 个 seq
             const int ns = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
 
             for (int32_t s = 0; s < ns; ++s) {
@@ -1608,6 +1609,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    // 如果需要输入 embedding，则需要输出所有 token 的embedding；
+    // 需要满足输出的 token 数等于总 token 数：n_outputs_all == n_token_all
     if (output_all) {
         // require that all tokens are output
         // embeddings 模式要求每个 token 都能输出对应结果，否则 pooled / token embedding 都无法正确取回。

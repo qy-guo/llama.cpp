@@ -233,13 +233,30 @@ extern "C" {
     //            )
     //
     typedef struct llama_batch {
+        // 当前 batch 的 token 数
+        // 输入 token、embd、pos 等内容都要和 n_tokens 一致
         int32_t n_tokens;
 
+        // 输入二选一：token 或 embd，另一个为空
         llama_token  *  token;
         float        *  embd;
+
+        // 每个 token 在 seq 的位置
         llama_pos    *  pos;
+
+        // 每个 token 属于多少 seq；
+        // n_seq_id[i]：第 i 个 token 属于几个 seq
+        // 例如 n_seq_id = [1, 2]，表示第 0 个 token 属于 1 个 seq，第 1 个 token 属于 2 个 token
         int32_t      *  n_seq_id;
+        
+        // seq_id 是一个二级指针，通常用于访问二维数据；
+        // 这里配合 llama_seq_id，在多 seq 推理中，标记第 i 个 token 属于哪几条 seq（seq_id）；
+        // seq_id[i]：第 i 个 token 对应的 llama_seq_id 列表首地址
+        // 例如 seq_id[0] = [0, 3]，表示第 0 个 token 属于 seq0 和 seq 3
         llama_seq_id ** seq_id;
+        
+        // 0 / 1 表示 batch 内部哪些 token 输出 / 不输出 logits；
+        // 例如 logits = [0, 0, 1]，表示只有第 3 个 token 输出了 logits
         int8_t       *  logits;   // TODO: rename this to "output"
     } llama_batch;
 
@@ -1237,6 +1254,11 @@ extern "C" {
 
     // user code can implement the interface below in order to create custom llama_sampler
     struct llama_sampler_i {
+        // 声明一个函数指针 name；
+        // 指向满足（1）返回类型 const char *（2）输入参数const struct llama_sampler * smpl 的函数；
+        // 假设满足条件的函数名为 func1，定义为：const char * func1 (const struct llama_sampler * smpl)
+        // 赋值：name = func1 或 name = &func1
+        // 调用：name(smpl) 或 (*name)(smpl)
         const char *           (*name)  (const struct llama_sampler * smpl);                                 // can be NULL
         void                   (*accept)(      struct llama_sampler * smpl, llama_token token);              // can be NULL
         void                   (*apply) (      struct llama_sampler * smpl, llama_token_data_array * cur_p); // required

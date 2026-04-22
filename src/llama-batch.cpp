@@ -885,20 +885,44 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*logits   =*/ nullptr,
     };
 
+    // 输入二选一：token 或 embd
+    // emdb：
+    // 分配 n_tokens_alloc * embd 个 float 大小的连续内存，batch.embd 指向该内存的起始地址
     if (embd) {
         batch.embd = (float *) malloc(sizeof(float) * n_tokens_alloc * embd);
+    // token：
+    // 分配 n_tokens_alloc 个 llama_token（int32_t）大小的连续内存，batch.token 指向该内存首地址
     } else {
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_tokens_alloc);
     }
 
+    // 分配 pos、n_seq_id 内存，每个 token 对应 1 个槽位
     batch.pos      = (llama_pos *)     malloc(sizeof(llama_pos)      * n_tokens_alloc);
     batch.n_seq_id = (int32_t *)       malloc(sizeof(int32_t)        * n_tokens_alloc);
+    
+
+    // 分配 n_tokens_alloc + 1 个 llama_seq_id * 指针大小（指针存储的是地址，通常是 8 byte）的连续内存；
+    // batch.seq_id 指向该内存的起始地址；
+    // 相当于一个一维数组，batch.seq_id[i] 是第 i 个 token 的 llama_seq_id * 指针
+    
+    // 注1：每个 llama_seq_id * 指针又指向一个一维数组的首地址；
+    //      因此 batch.seq_id 是一个行间不一定连续的二维数组，形状为 [n_tokens_alloc + 1, n_seq_max]
+    
+    // 注2：batch.seq_id[i] 表示第 i 个 token 属于哪些 seq；
+    //      例如 batch.seq_id[0] = [0, 3] 表示第 0 个 token属于 seq 0 和 seq 3
+
     batch.seq_id   = (llama_seq_id **) malloc(sizeof(llama_seq_id *) * (n_tokens_alloc + 1));
+    
+
+    // 为每个 token 的 llama_seq_id * 指针分配 n_seq_max 个 llama_seq_id（int32_t）大小的连续内存；
+    // bat.seq_ids[i] 指向第 i 个连续内存的首地址
     for (int i = 0; i < n_tokens_alloc; ++i) {
         batch.seq_id[i] = (llama_seq_id *) malloc(sizeof(llama_seq_id) * n_seq_max);
     }
+    // 哨兵标记，用于 free
     batch.seq_id[n_tokens_alloc] = nullptr;
 
+    // 分配 logits 内存，每个 token 对应 1 个插槽
     batch.logits   = (int8_t *)        malloc(sizeof(int8_t)         * n_tokens_alloc);
 
     return batch;
@@ -909,6 +933,9 @@ void llama_batch_free(struct llama_batch batch) {
     if (batch.embd)     free(batch.embd);
     if (batch.pos)      free(batch.pos);
     if (batch.n_seq_id) free(batch.n_seq_id);
+
+    // batch.seq_id 是 二级指针结构，直接 free 只能释放二级指针，会内存泄露
+    // 根据哨兵标记，free 每个 token 的 seq_id
     if (batch.seq_id) {
         for (int i = 0; batch.seq_id[i] != nullptr; ++i) {
             free(batch.seq_id[i]);

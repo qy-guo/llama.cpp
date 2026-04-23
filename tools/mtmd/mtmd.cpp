@@ -75,14 +75,14 @@ struct mtmd_audio_tokens {
 using mtmd_audio_tokens_ptr = std::unique_ptr<mtmd_audio_tokens>;
 
 struct mtmd_input_chunk {
-    mtmd_input_chunk_type type;
-    std::vector<llama_token> tokens_text;
-    mtmd_image_tokens_ptr tokens_image;
-    mtmd_audio_tokens_ptr tokens_audio;
+    mtmd_input_chunk_type type;                 // chunk 类型，包含 text、image、audio
+    std::vector<llama_token> tokens_text;       // chunk 内的 token ids
+    mtmd_image_tokens_ptr tokens_image;         // 指向 mtmd_image_tokens，只有当 type 为 image 才使用
+    mtmd_audio_tokens_ptr tokens_audio;         // 指向 mtmd_audio_tokens，只有当 type 为 audio 才使用
 };
 
 struct mtmd_input_chunks {
-    std::vector<mtmd_input_chunk> entries;
+    std::vector<mtmd_input_chunk> entries;      // mtmd_input_chunk 组成的数组
 };
 
 // slice template, used by some llava-uhd models to correctly place the special tokens around image embeddings
@@ -128,16 +128,19 @@ mtmd_context_params mtmd_context_params_default() {
 }
 
 struct mtmd_context {
+    // 指向视觉编码器的上下文对象
     struct clip_ctx * ctx_v; // vision
+    // 指向音频编码器的上下文对象
     struct clip_ctx * ctx_a; // audio
+    // 最终推理的文本 LLM 对象
     const struct llama_model * text_model;
     std::vector<float> image_embd_v; // image embedding vector
 
-    bool print_timings;
-    int n_threads;
-    std::string media_marker;
-    const int n_embd_text;
-    mtmd_pos_type pos_type;
+    bool print_timings;         // 是否打印时间
+    int n_threads;              // 线程数
+    std::string media_marker;   // prompt 中的 media 占位符
+    const int n_embd_text;      // text embedding 维数
+    mtmd_pos_type pos_type;     // 多模态位置编码的 type
 
     // these are not token, but strings used to mark the beginning and end of image/audio embeddings
     std::string img_beg;
@@ -599,6 +602,11 @@ struct mtmd_tokenizer {
 
     mtmd_input_chunks cur;
 
+
+    // ctx：用来拿多模态上下文、text_model、media_marker等
+    // text：输入文本及配置
+    // bitmaps：多模态输入数组（mtmd_bitmap：位图，是一个图片的原始像素数据）
+    // n_bitmaps：bitmaps 数组长度
     mtmd_tokenizer(mtmd_context * ctx,
             const mtmd_input_text * text,
             const mtmd_bitmap ** bitmaps,
@@ -609,11 +617,20 @@ struct mtmd_tokenizer {
         vocab         = llama_model_get_vocab(ctx->text_model);
     }
 
+    // tokenize
     int32_t tokenize(mtmd_input_chunks * output) {
         cur.entries.clear();
+
+        // 1. 拆分
+        
+        // 把输入拆分成类似 [text, media_marker, text, media_marker, text]
         std::vector<std::string> parts = split_text(input_text, ctx->media_marker);
+        // 记录当前要取的位图索引
         size_t i_bm = 0; // index of the current bitmap
+        
         for (auto & part : parts) {
+            
+            // 如果当前 part 是 media_marker，走 media 处理
             if (part == ctx->media_marker) {
                 // this is a marker, we should add the next bitmap
                 if (i_bm >= bitmaps.size()) {
@@ -621,6 +638,9 @@ struct mtmd_tokenizer {
                             __func__, bitmaps.size(), parts.size() - 1);
                     return 1;
                 }
+
+                // 取出当前这张 bitmap，索引 + 1
+                // 对这张 bitmap 走 add_media() 处理
                 const mtmd_bitmap * bitmap = bitmaps[i_bm++];
                 int32_t res = add_media(bitmap);
                 if (res != 0) {
@@ -677,12 +697,13 @@ struct mtmd_tokenizer {
             return;
         }
         // if last entry is also a text chunk, add tokens to it instead of creating new chunk
+        // 如果当前已经有 chunk，且最后一个 chunk 是 text chunk，则把新的 token_ids 追加到后面
         if (!cur.entries.empty() && cur.entries.back().type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
             cur.entries.back().tokens_text.insert(
                                             cur.entries.back().tokens_text.end(),
                                             tokens.begin(),
                                             tokens.end());
-        } else {
+        } else {    // 否则（如果当前没有 chunk，或者最后一个 chunk 不是 text 类型），新创建一个 text chunk
             mtmd_input_chunk chunk{
                 MTMD_INPUT_CHUNK_TYPE_TEXT,
                 tokens,
@@ -694,6 +715,7 @@ struct mtmd_tokenizer {
     }
 
     int32_t add_media(const mtmd_bitmap * bitmap) {
+        // 走图像分支
         if (!bitmap->is_audio) {
             // handle image
 
@@ -920,11 +942,16 @@ struct mtmd_tokenizer {
     // for example: "a <__media__> b <__media__> c" --> "a", "<__media__>", "b", "<__media__>", "c"
     static std::vector<std::string> split_text(const std::string & input, const std::string & delimiter) {
         std::vector<std::string> result;
+        
+        // input 为空，返回空
         if (input.empty()) {
             return result;
         }
+
         size_t start = 0;
         size_t pos = 0;
+
+        // 把 char 按照分割符分成多个部分，每个部分（包含分隔符）都加入 result
         while ((pos = input.find(delimiter, start)) != std::string::npos) {
             if (pos > start) {
                 result.push_back(input.substr(start, pos - start));
@@ -945,15 +972,22 @@ struct mtmd_tokenizer {
                             bool   add_special,
                             bool   parse_special) {
         // upper limit for the number of tokens
+        // 用字节长度 + 2 来预分配 token 的 buffer 
         int n_tokens = text.length() + 2 * add_special;
         std::vector<llama_token> result(n_tokens);
+
+
+        // 根据 vocab 对 text 进行 tokenize
+        // 若成功，则返回 token 数；若 buffer 不够，则返回负数，其绝对值是实际需要的 buffer 大小，即实际 token 数
         n_tokens = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
+        
+        // 若预估的 buffer 不足，按照返回的实际 token 大小重新分配
         if (n_tokens < 0) {
             result.resize(-n_tokens);
             int check = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
             GGML_ASSERT(check == -n_tokens);
         } else {
-            result.resize(n_tokens);
+            result.resize(n_tokens);        // buffer 足够，丢掉多余空间
         }
         return result;
     }
@@ -964,6 +998,8 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
             const mtmd_input_text * text,
             const mtmd_bitmap ** bitmaps,
             size_t n_bitmaps) {
+    
+    // 构造 tokenizer
     mtmd_tokenizer tokenizer(ctx, text, bitmaps, n_bitmaps);
     return tokenizer.tokenize(output);
 }

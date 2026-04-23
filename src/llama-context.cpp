@@ -1568,25 +1568,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
     // TODO: avoid this workaround in the future
-    // 如果启用采样（std::map samplers 非空）且 logits 存在；
+    // 如果启用采样（std::map samplers 非空）&& logits 不为 nullptr，保证每条 seq 最多输出 1 个 token
     if (has_samplers && batch_inp.logits) {
-        // backend sampling 的当前实现要求：每个 sequence 在这一批里最多只能有一个输出 token。
-        // 这里按 seq_id 统计“被要求输出 logits 的 token 数”；如果超过 1，就直接报错。
+
+        // backend sampling 的当前实现要求：每个 sequence 在这一批里最多只能有一个输出 token
+        // 用 seq_output_count[s] 统计第 s 个 seq 当前有几个输出 token；如果超过 1，就直接报错
         std::vector<int32_t> seq_output_count(n_seq_max, 0);
 
         for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+
+            // 跳过 0，因为 logits[i] = 0 表示第 i 个 token 未输出 logits
             if (batch_inp.logits[i] == 0) {
                 continue;
             }
             
-            // ns 记录当前 batch 中第 i 个 token 属于几条 seq；
-            // 不传默认每个 token 属于 1 个 seq
+            // ns：第 i 个 token 的关联几条 seq（n_seq_id）
+            // 不传默认每个 token 关联 1 个 seq
             const int ns = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
 
             for (int32_t s = 0; s < ns; ++s) {
+                // seq_id[i][s]：第 i 个 token 关联的第 s 个 seq 的 seq_id
                 const llama_seq_id seq_id = batch_inp.seq_id ? batch_inp.seq_id[i][s] : 0;
-
+                
+                // 该 seq_id 的输出 token 数 + 1
                 seq_output_count[seq_id]++;
+                // 若一条 seq 的输出 token 数 > 1，报错
                 if (seq_output_count[seq_id] > 1) {
                     LLAMA_LOG_ERROR("%s: backend sampling requires at most one output token per sequence (seq_id %d had %d)\n",
                             __func__, seq_id, seq_output_count[seq_id]);
@@ -1596,15 +1602,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    // batch allocator 负责把调用方传入的 llama_batch 规整成内部可消费的形式：
-    // 包括 token/embd 二选一输入、位置、seq_id、输出标记等。
-    // 失败通常意味着 batch 本身不合法或无法映射到当前 context/memory 约束。
+    // std::unique_ptr<llama_batch_allocr> balloc
+    // 负责把调用方传入的 llama_batch 规整成内部可消费的形式：token/embd 输入、pos、seq_id 等
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
 
-    // 规整后的总 token 数、总输出数。
+    // n_token_all：batch 里一共有多少个输入 token
+    // n_outputs_all：batch 里有多少个 token 被标记为"需要输出结果"
     // 注意二者不一定相等：例如只请求最后一个 token 输出时，n_outputs_all 可能远小于 n_tokens_all。
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();

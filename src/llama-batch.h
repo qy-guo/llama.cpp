@@ -143,7 +143,7 @@ private:
     std::vector<llama_seq_id *> seq_id;
     std::vector<llama_seq_id>   seq_id_unq;
     std::vector<int32_t>        seq_idx;
-    std::vector<int8_t>         output;
+    std::vector<int8_t>         output;         // 对应 llama_batch.logits
 
     using pos_set_t = std::set<llama_pos>;
     using seq_cpl_t = std::vector<bool>;

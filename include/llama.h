@@ -244,15 +244,15 @@ extern "C" {
         // 每个 token 在 seq 的位置
         llama_pos    *  pos;
 
-        // 每个 token 属于多少 seq；
-        // n_seq_id[i]：第 i 个 token 属于几个 seq
-        // 例如 n_seq_id = [1, 2]，表示第 0 个 token 属于 1 个 seq，第 1 个 token 属于 2 个 token
+        // 每个 token 关联多少 seq；
+        // n_seq_id[i]：第 i 个 token 关联几个 seq
+        // 例如 n_seq_id = [1, 2]，表示第 0 个 token 关联 1 个 seq，第 1 个 token 关联 2 个 token
         int32_t      *  n_seq_id;
         
         // seq_id 是一个二级指针，通常用于访问二维数据；
-        // 这里配合 llama_seq_id，在多 seq 推理中，标记第 i 个 token 属于哪几条 seq（seq_id）；
+        // 这里配合 llama_seq_id，在多 seq 推理中，标记第 i 个 token 关联哪几条 seq（seq_id）；
         // seq_id[i]：第 i 个 token 对应的 llama_seq_id 列表首地址
-        // 例如 seq_id[0] = [0, 3]，表示第 0 个 token 属于 seq0 和 seq 3
+        // 例如 seq_id[0] = [0, 3]，表示第 0 个 token 关联的第 0 个和第 1 个 seq 是 seq 0 和 seq 3
         llama_seq_id ** seq_id;
         
         // 0 / 1 表示 batch 内部哪些 token 输出 / 不输出 logits；

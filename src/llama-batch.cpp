@@ -117,17 +117,26 @@ bool llama_batch_allocr::init(
         batch.pos = pos.data();
     }
 
+
+    // 如果缺少指定输出 token 的 batch.logits，则进行初始化
     if (!batch.logits) {
+
+        // 若 output_all = ture，则令所有元素都为 true，即输出所有 token 
         if (output_all) {
             // return the output for all tokens
             output.resize(batch.n_tokens, true);
+
+        // 若 output_all = false，则令所有元素都为 false、最后一个元素为 true，即输出最后一个 token 
         } else {
             // return the output only for the last token
             output.resize(batch.n_tokens, false);
             output[output.size() - 1] = true;
         }
-
-        batch.logits = output.data();
+        
+        // batch.logits 指向 output 数组的首地址
+        // 当 output 非空时，等价于 batch.logits = &output[0]
+        // 当 output 为空时，只有用 .data() 不会报错
+        batch.logits = output.data();       // 源码的 TODO 表示后续会把 llama_batch 的 logits 更名为 output
     } else if (output_all) {
         bool warn = false;
 
@@ -153,6 +162,8 @@ bool llama_batch_allocr::init(
     this->n_seq_max = n_seq_max;
 
     // count the outputs in this batch
+    // n_outputs 记录 batch 中需要输出结果的 token 数
+    // 注：batch.logits[i] 记录是否需要输出 logits，0：不输出；1：输出
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         n_outputs += batch.logits[i] != 0;
     }

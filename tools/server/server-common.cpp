@@ -345,6 +345,8 @@ const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
 }
 
 void server_tokens::push_back(llama_token tok) {
+    // 加入非 LLAMA_TOKEN_NULL 的 token
+
     if (tok == LLAMA_TOKEN_NULL) {
         throw std::runtime_error("Invalid token");
     }
@@ -374,10 +376,15 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
 }
 
 void server_tokens::push_back(server_tokens & tokens) {
+    // start_idx = this -> size()，即 this -> tokens.size()
     size_t start_idx = size();
+
+    // 逐个加入非 LLAMA_TOKEN_NULL 的 token
     for (size_t i = 0; i < tokens.size(); i++) {
         push_back(tokens[i]);
     }
+
+    // 如果是多模态（has_mtmd = true）
     if (tokens.has_mtmd) {
         // Assert if we are copying MTMD chunks to a server_tokens that does not have mtmd.
         // We could also just check, but this will prevent silently dropping MTMD data.
@@ -714,8 +721,14 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
 }
 
 server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
+    // 存储解码后的 files
     mtmd::bitmaps bitmaps;
+    
+    // 依次解码 file
     for (auto & file : files) {
+
+        // 将 image 或 audio 解码并保存成 mtmd_bitmap 类型
+        // 调用 bitmap 的 bitmap(mtmd_bitmap * bitmap) 构造函数，默认 bmp.ptr 指向解码后的 mtmd_bitmap 类型
         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
         if (!bmp.ptr) {
             throw std::runtime_error("Failed to load image or audio file");
@@ -735,6 +748,8 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
     };
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
     auto bitmaps_c_ptr = bitmaps.c_ptr();
+
+    // 调用 tokenize，结果保存到 chunks 中，并返回运行状态结果 tokenized
     int32_t tokenized = mtmd_tokenize(mctx,
                                       chunks.ptr.get(),
                                       &inp_txt,
@@ -743,6 +758,8 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
     if (tokenized != 0) {
         throw std::runtime_error("Failed to tokenize prompt");
     }
+
+    // chunks 包装成 server_tokens 类型
     auto result = server_tokens(chunks, true);
     return result;
 }

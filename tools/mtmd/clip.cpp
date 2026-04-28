@@ -2788,16 +2788,19 @@ const char * clip_patch_merge_type(const struct clip_ctx * ctx) {
 
 int clip_n_output_tokens_x(const struct clip_ctx * ctx, struct clip_image_f32 * img) {
     const auto & params = ctx->model.hparams;
+
+    // 获取当前图片对应的 vision token 数
     const int n_total = clip_n_output_tokens(ctx, img);
     const auto & proj = ctx->proj_type();
     switch (proj) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
-        case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_QWEN3VL:    // Qwen3VL
         case PROJECTOR_TYPE_GLM4V:
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_HUNYUANOCR:
         case PROJECTOR_TYPE_YOUTUVL:
+            // x 轴上的 token 数
             return (img->nx / params.patch_size) / 2;
         case PROJECTOR_TYPE_STEP3VL:
             return img->nx / (params.patch_size * params.n_merge);
@@ -2881,11 +2884,13 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
             } break;
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
-        case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_QWEN3VL:    // Qwen3VL 走这条分支
         case PROJECTOR_TYPE_GLM4V:
         case PROJECTOR_TYPE_YOUTUVL:
             {
                 // dynamic size (2 conv, so double patch size)
+                // patch 数 = (nx / patch_size) * (ny / patch_size)
+                // token 数 = patch 数 // (2 * 2)
                 int x_patch = img->nx / (params.patch_size * 2);
                 int y_patch = img->ny / (params.patch_size * 2);
                 n_patches = x_patch * y_patch;
@@ -3040,6 +3045,9 @@ bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f3
 }
 
 bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, float * vec) {
+    
+    // batch_size = image_tokens->batch_f32 的 entries 数
+    // batch_size 目前写死必须 = 1
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
 
@@ -3050,25 +3058,32 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     }
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
+    // 分配资源，为后续执行 graph 准备 buffer 和后端资源
     if (!ctx->is_allocated) {
         clip_model_loader::warmup(*ctx, *imgs_c_ptr);
     }
 
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
-    ggml_cgraph * gf = clip_image_build_graph(ctx, imgs);
+    ggml_cgraph * gf = clip_image_build_graph(ctx, imgs);   // 构建 graph
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
 
     // set inputs
-    const auto & model   = ctx->model;
-    const auto & hparams = model.hparams;
+    const auto & model   = ctx->model;      // clip model
+    const auto & hparams = model.hparams;   // 模型超参数
 
+    // W、H
     const int image_size_width  = imgs.entries[0]->nx;
     const int image_size_height = imgs.entries[0]->ny;
 
+    // patch 大小和数量
     const int patch_size    = hparams.patch_size;
     const int num_patches   = ((image_size_width / patch_size) * (image_size_height / patch_size));
+    
+    //
     const int n_pos = num_patches + (model.class_embedding ? 1 : 0);
+    
+    // pos，宽、高上的 patch 数
     const int pos_w = image_size_width  / patch_size;
     const int pos_h = image_size_height / patch_size;
 
@@ -3657,6 +3672,10 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_YOUTUVL:
             return ctx->model.mm_1_b->ne[0];
+        
+        // Qwen3VL 多模态 projector 的 embedding 大小
+        // Qwen3.5-0.8B 的 model.mm_1_b->ne[0] = 1024
+        //                 model.n_deepstack_layers = 0
         case PROJECTOR_TYPE_QWEN3VL:
             // main path + deepstack paths
             return ctx->model.mm_1_b->ne[0] * (1 + ctx->model.n_deepstack_layers);

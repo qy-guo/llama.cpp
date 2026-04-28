@@ -800,11 +800,14 @@ private:
         }
 
         std::string & mmproj_path = params_base.mmproj.path;
+        
+        // 如果命令行提供了 mmproj.path，创建多模态上下文
         if (!mmproj_path.empty()) {
             if (!is_resume) {
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
-
+            
+            // 创建多模态上下文
             mtmd_context_params mparams = mtmd_context_params_default();
 
             mparams.use_gpu          = params_base.mmproj_use_gpu;
@@ -3182,7 +3185,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // process prompt
         std::vector<server_tokens> inputs;
+        
 
+        // 如果是 OAI chat 路径且多模态上下文不为空，则调用 process_mtmd_prompt
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
@@ -3755,9 +3760,11 @@ void server_routes::init_routes() {
             TASK_RESPONSE_TYPE_OAI_CMPL);
     };
 
+    // 当用户从浏览器 WebUI 或外部客户端发送 chat 请求时，路由到该函数
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
+        // 解析请求体 JSON
         json body = json::parse(req.body);
         json body_parsed = oaicompat_chat_params_parse(
             body,

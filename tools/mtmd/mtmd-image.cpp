@@ -34,22 +34,26 @@ void mtmd_image_preprocessor::img_u8_to_f32(const clip_image_u8 & src, clip_imag
 // in the future, we can have HW acceleration by allowing this struct to access 3rd party lib like imagick or opencv
 struct img_tool {
     static void resize(
-            const clip_image_u8 & src,
-            clip_image_u8 & dst,
-            const clip_image_size & target_resolution,
-            resize_algo algo,
+            const clip_image_u8 & src,  // 原始图像
+            clip_image_u8 & dst,        // resize 后的图像
+            const clip_image_size & target_resolution,  // resize 的图像大小
+            resize_algo algo,           // 对于Qwen3VL：RESIZE_ALGO_BILINEAR
             bool add_padding = true, // TODO: define the behavior for add_padding = false
             std::array<uint8_t, 3> pad_color = {0, 0, 0}) {
+        
+        // resize 后的图像形状
         dst.nx = target_resolution.width;
         dst.ny = target_resolution.height;
         dst.buf.resize(3 * dst.nx * dst.ny);
-
+        
+        // resize 前后图像形状相同，进行简单复制后 return
         if (dst.nx == src.nx && dst.ny == src.ny) {
             // no resize needed, simple copy
             dst.buf = src.buf;
             return;
         }
-
+        
+        // 如果 add_padding = false，直接 resize 图片到目标宽、高
         if (!add_padding) {
             // direct resize
             switch (algo) {
@@ -65,7 +69,11 @@ struct img_tool {
                 default:
                     throw std::runtime_error("Unsupported resize algorithm");
             }
-        } else {
+        } 
+        
+        // 如果 add_padding = true，使用 padding 进行 resize
+        // Qwen3VL 走该分支
+        else {
             // resize with padding
             clip_image_u8 resized_image;
             float scale_w = static_cast<float>(target_resolution.width) / src.nx;
@@ -75,6 +83,8 @@ struct img_tool {
             int new_height = std::min(static_cast<int>(std::ceil(src.ny * scale)), target_resolution.height);
 
             switch (algo) {
+                // 双线性插值法
+                // Qwen3VL 走该分支
                 case RESIZE_ALGO_BILINEAR:
                     resize_bilinear(src, resized_image, new_width, new_height);
                     break;
@@ -89,8 +99,10 @@ struct img_tool {
             }
 
             // fill dst with pad_color
+            // 用 pad_color 填充目标图的所有像素，默认为 {0, 0, 0}
             fill(dst, pad_color);
-
+            
+            // 计算上下、左右的 offset，用于将 resize 后的图像居中放入 dst
             int offset_x = (target_resolution.width  - new_width)  / 2;
             int offset_y = (target_resolution.height - new_height) / 2;
 
@@ -142,23 +154,35 @@ struct img_tool {
     // the calculated size will have min_pixels <= W*H <= max_pixels
     // this is referred as "smart_resize" in transformers code
     static clip_image_size calc_size_preserved_ratio(const clip_image_size & inp_size, const int align_size, const int min_pixels, const int max_pixels) {
+        // 对于 Qwen3VL：
+        // align_size = patch_size * cur_merge；cur_merge = 2
         GGML_ASSERT(align_size > 0);
         const int width  = inp_size.width;
         const int height = inp_size.height;
 
+        // lamabda ，对任意 float x，按 align_size 整数倍进行四舍五入、向上取整、向下取整
         auto round_by_factor = [f = align_size](float x) { return static_cast<int>(std::round(x / static_cast<float>(f))) * f; };
         auto ceil_by_factor  = [f = align_size](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
         auto floor_by_factor = [f = align_size](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
 
         // always align up first
+        // 对 h_bar、w_bar 按 align_size 整数倍进行四舍五入，值最小不低于 align_size
         int h_bar = std::max(align_size, round_by_factor(height));
         int w_bar = std::max(align_size, round_by_factor(width));
 
+        // 如果处理后的像素数（h_bar * w_bar）> max_pixels
+        // 则h_bar、w_bar同时除以缩放系数beta，并按align_size整数倍进行向下取整
+        // beta = sqrt(原始像素数 / max_pixels)
         if (h_bar * w_bar > max_pixels) {
             const auto beta = std::sqrt(static_cast<float>(height * width) / max_pixels);
             h_bar = std::max(align_size, floor_by_factor(height / beta));
             w_bar = std::max(align_size, floor_by_factor(width  / beta));
-        } else if (h_bar * w_bar < min_pixels) {
+        } 
+        
+        // 如果处理后的像素数（h_bar * w_bar）< min_pixels
+        // 则h_bar、w_bar同时除以缩放系数beta，并按align_size整数倍进行向上取整
+        // beta = sqrt(min_pixels / 原始像素数)
+        else if (h_bar * w_bar < min_pixels) {
             const auto beta = std::sqrt(static_cast<float>(min_pixels) / (height * width));
             h_bar = ceil_by_factor(height * beta);
             w_bar = ceil_by_factor(width * beta);
@@ -197,11 +221,19 @@ struct img_tool {
 
 private:
     // Bilinear resize function
+    // 双线性插值法，Qwen3VL 使用该方法对图像进行 resize
+    // src：原始图像
+    // dst：resize 后的目标图像
+    // target_width：目标图像 w
+    // target_height：目标图像 h
     static void resize_bilinear(const clip_image_u8 & src, clip_image_u8 & dst, int target_width, int target_height) {
+        // 边界检查
+        // 原始图像形状存在 0，令目标图像为空
         if (src.nx == 0 || src.ny == 0) { dst.nx = dst.ny = 0; dst.buf.clear(); return; }
-        if (target_width  <= 0) target_width  = 1;
-        if (target_height <= 0) target_height = 1;
-
+        if (target_width  <= 0) target_width  = 1;  // 用 1 修正负数目标图像 w
+        if (target_height <= 0) target_height = 1;  // 用 1 修正负数目标图像 h
+        
+        // 确保目标图像形状正确
         dst.nx = target_width;
         dst.ny = target_height;
         dst.buf.resize(3 * target_width * target_height);
@@ -857,23 +889,49 @@ bool mtmd_image_preprocessor_fixed_size::preprocess(const clip_image_u8 & img, c
 //
 
 bool mtmd_image_preprocessor_dyn_size::preprocess(const clip_image_u8 & img, clip_image_f32_batch & output) {
+    // 检查模型的图像像素上下限大于 0
     GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
+    
+    // 记录 resize 后的图像
     clip_image_u8 resized_image;
+    
+    // 记录原始 image 的 H、W
     const clip_image_size original_size{img.nx, img.ny};
+    
     // the original pixtral model doesn't have n_merge
+    // 加载 hparams 的 n_merge，如果不存在（等于 0），则赋值为 1
+    // 对于 Qwen2VL、Qwen25VL、Qwen3VL：hparams.n_merge = 2
     const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
+    
+    // 调用 calc_size_preserved_ratio()，计算出 target_size
+    // 传入原始 image 尺寸、resize 后的尺寸、最小像素、最大像素
+    // 返回符合要求的 resize 尺寸 target_size
     const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
         original_size,
         hparams.patch_size * cur_merge,
         hparams.image_min_pixels,
         hparams.image_max_pixels);
+    
+    // 根据计算的 target_size，对原始图像进行 resize
+    // 对于 Qwen3VL 的 clip_hparams 来说：
+    // hparams.image_resize_algo = RESIZE_ALGO_BILINEAR
+    // hparams.image_resize_pad = true
+    // image_pad_color = {0, 0, 0}
     img_tool::resize(img, resized_image, target_size,
                         hparams.image_resize_algo,
                         hparams.image_resize_pad,
                         hparams.image_pad_color);
+
+    //img_f32 指向 clip_image_f32_init() 返回的 clip_image_f32_ptr 对象
     clip_image_f32_ptr img_f32(clip_image_f32_init());
+    
+    // 将 u8 的图像数据转换成 f32，并进行通道维度的归一化
     img_u8_to_f32(resized_image, *img_f32, hparams.image_mean, hparams.image_std);
+    
+    // 加入图像列表 entries
+    // 这里只会加入 1 个图像的信息
     output.entries.push_back(std::move(img_f32));
+    
     return true;
 }
 

@@ -243,39 +243,61 @@ int32_t mtmd_helper_decode_image_chunk(
         int32_t n_batch,
         llama_pos * new_n_past) {
     GGML_ASSERT(n_batch > 0);
+    
+    // 获取 chunk 类型（image 或 audio）
     auto chunk_type = mtmd_input_chunk_get_type(chunk);
     const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
+
+    // 如果是 text 类型，则报错
     if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         LOG_ERR("failed to decode chunk: input chunk not of image/audio type\n");
         return -1;
     }
 
+    // 获取 model、mmproj 维度、pos 维度信息
     const llama_model * model = llama_get_model(lctx);
     int n_mmproj_embd = llama_model_n_embd_inp(model);
-    int n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
+    int n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;    // M-RoPE 是 4 维，其他是 1 维
 
+    // 获取 chunk 的 token 数、chunk 对应所需的 batch 数
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
     int32_t i_batch = 0;
     int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
 
+    // 如果使用 M-RoPE 位置编码
     if (mtmd_decode_use_mrope(ctx)) {
+        // 对于 image chunk
         if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            // 获取 token
             const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
             if (!image_tokens) {
                 LOG_ERR("failed to decode chunk: image tokens are null\n");
                 return -1;
             }
+
+            // 重新获取一次 chunk token 数
             const auto n_tokens = mtmd_image_tokens_get_n_tokens(image_tokens);
+
+            // 定义一个长为 n_tokens 的数组，数组元素是 mtmd_decoder_pos 类型
+            // mtmd_decoder_pos 类型包含 4 个值，代表 4 个维度，用于 M-RoPE
             std::vector<mtmd_decoder_pos> rel_pos(n_tokens);
+
             mtmd_helper_image_get_decoder_pos(image_tokens, n_past, rel_pos.data());
+            
             batch_embd.set_position_mrope_2d(rel_pos, seq_id);
-        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        } 
+        
+        // 对于 audio chunk
+        else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
             batch_embd.set_position_mrope_1d(n_past, seq_id);
         } else {
             GGML_ABORT("invalid chunk type for M-RoPE");
         }
-    } else {
+    } 
+    
+    // 如果不使用 M-RoPE 位置编码，则是 1 维
+    else {
         batch_embd.set_position_normal(n_past, seq_id);
     }
 
@@ -324,11 +346,19 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
         llama_pos * new_n_past) {
     GGML_ASSERT(n_batch > 0);
     int32_t ret;
+
+    // 初始化 batch，输入为 token
     llama_batch text_batch = llama_batch_init(n_batch, 0, 1);
+    
+    // chunk 类型
     auto chunk_type = mtmd_input_chunk_get_type(chunk);
 
+    // text 类型 chunk
     if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         size_t n_tokens;
+
+        // tokens = chunk 中的 token ids
+        // n_tokens 记录 chunk 中的 token 数
         const auto tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
         // LOG_INF("decoding text chunk, n_tokens = %zu\n", n_tokens);
         size_t i = 0;
@@ -336,18 +366,23 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
             text_batch.n_tokens = 0; // clear the batch
             for (; i < n_tokens && text_batch.n_tokens < n_batch; i++) {
                 int32_t j = text_batch.n_tokens;
-                text_batch.token   [j]    = tokens[i];
+                text_batch.token   [j]    = tokens[i];  // 第 j 个 token 来自 tokens[i]
                 text_batch.pos     [j]    = n_past++;
-                text_batch.n_seq_id[j]    = 1;
-                text_batch.seq_id  [j][0] = seq_id;
-                text_batch.logits  [j]    = false;
+                text_batch.n_seq_id[j]    = 1;          // 第 j 个 token 属于 1 条 seq
+                text_batch.seq_id  [j][0] = seq_id;     // 第 j 个 token 所属的第 0 个 seq id
+                text_batch.logits  [j]    = false;      // 第 j 个 token 不需要输出 logits
 
-                text_batch.n_tokens++;
+                text_batch.n_tokens++;      // 当前 text_batch token 数 + 1
             }
+
+            // 如果是最后 1 个 token 且需要输出最后 1 个 token 的 logits
+            // 则令 text_batch.logits[-1] = true
             bool is_last_token = (i == n_tokens);
             if (logits_last && is_last_token) {
                 text_batch.logits[text_batch.n_tokens - 1] = true;
             }
+
+
             ret = llama_decode(lctx, text_batch);
             if (ret != 0) {
                 LOG_ERR("failed to decode text\n");
@@ -357,12 +392,18 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
             *new_n_past += text_batch.n_tokens;
         }
 
-    } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE || chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+    } 
+    
+    // image 或 audio 类型 chunk
+    else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE || chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        
+        // 获取 chunk 具体类型
         const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
         int64_t t0 = ggml_time_ms();
 
         LOG_INF("encoding %s slice...\n", name);
 
+        // 传入 chunk，路由 image chunk 和 audio chunk 到不同的处理逻辑
         ret = mtmd_encode_chunk(ctx, chunk);
         if (ret != 0) {
             LOG_ERR("failed to encode %s slice\n", name);
@@ -372,6 +413,7 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
 
         LOG_INF("%s slice encoded in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
 
+        // 获取 chunk 内所有 token 的 embedding
         float * embd = mtmd_get_output_embd(ctx);
         ret = mtmd_helper_decode_image_chunk(ctx, lctx, chunk, embd, n_past, seq_id, n_batch, new_n_past);
         if (ret != 0) {
@@ -479,6 +521,7 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 } // namespace audio_helpers
 
 mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
+    // 解码 audio
     if (audio_helpers::is_audio_file((const char *)buf, len)) {
         std::vector<float> pcmf32;
         const int sample_rate = mtmd_get_audio_sample_rate(ctx);
@@ -494,6 +537,7 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigne
     }
 
     // otherwise, we assume it's an image
+    // 解码 image
     mtmd_bitmap * result = nullptr;
     {
         int nx, ny, nc;

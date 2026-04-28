@@ -34,17 +34,32 @@ struct mtmd_bitmap {
 };
 
 // position indexing for decoder model
+// 位置编码种类
 enum mtmd_pos_type {
+    // 非 M-RoPE，一维 pos_id
     MTMD_POS_TYPE_NORMAL, // number of positions equals to number of tokens
+    // M-RoPE，二维 pos_id
     MTMD_POS_TYPE_MROPE, // qwen-vl mrope style, each image takes max(t,h,w) position indexes
 };
 
+// 一个输入图像（bitmap）的容器
 struct mtmd_image_tokens {
+    // vision token 位置信息
+    // 若使用 M-RoPE，则是二维
+    // 若不适用 M-RoPE，则是一维，ny = 1
     uint32_t nx; // number of tokens in x direction
     uint32_t ny; // number of tokens in y direction
+
+    // 位置编码种类：非 M-RoPE 或 M-RoPE
     mtmd_pos_type pos = MTMD_POS_TYPE_NORMAL;
+
+    // image 对应的 vision token 数
     uint32_t n_tokens() const { return nx * ny; }
+
+    // 输入 bitmap 对应的所有派生的图像数据（Qwen3VL 1 个 image 对应 1 张图像）
     clip_image_f32_batch batch_f32; // preprocessed image patches
+
+    // id，用于 kv cache
     std::string id; // optional user-defined ID, useful for KV cache tracking
 
     mtmd_image_tokens clone() {
@@ -76,7 +91,7 @@ using mtmd_audio_tokens_ptr = std::unique_ptr<mtmd_audio_tokens>;
 
 struct mtmd_input_chunk {
     mtmd_input_chunk_type type;                 // chunk 类型，包含 text、image、audio
-    std::vector<llama_token> tokens_text;       // chunk 内的 token ids
+    std::vector<llama_token> tokens_text;       // chunk 内的 token ids，只有当 type 为 text 才不为空
     mtmd_image_tokens_ptr tokens_image;         // 指向 mtmd_image_tokens，只有当 type 为 image 才使用
     mtmd_audio_tokens_ptr tokens_audio;         // 指向 mtmd_audio_tokens，只有当 type 为 audio 才使用
 };
@@ -134,6 +149,8 @@ struct mtmd_context {
     struct clip_ctx * ctx_a; // audio
     // 最终推理的文本 LLM 对象
     const struct llama_model * text_model;
+
+    // 最近一次 encode 存储的所有 image token 经过 mm encode 后的 embedding
     std::vector<float> image_embd_v; // image embedding vector
 
     bool print_timings;         // 是否打印时间
@@ -165,8 +182,8 @@ struct mtmd_context {
     // string template for slice image delimiters with row/col (idefics3)
     std::string sli_img_start_tmpl;
 
-    std::unique_ptr<mtmd_audio_preprocessor> audio_preproc;
-    std::unique_ptr<mtmd_image_preprocessor> image_preproc;
+    std::unique_ptr<mtmd_audio_preprocessor> audio_preproc; // 指向音频预处理器基类的指针
+    std::unique_ptr<mtmd_image_preprocessor> image_preproc; // 指向图像预处理器基类的指针
 
     // TODO @ngxson : add timings
 
@@ -241,10 +258,10 @@ struct mtmd_context {
                 n_embd_text, n_embd_clip));
         }
         if (ctx_v) {
-            init_vision();
+            init_vision();  // 确定 image_preproc 的具体实例子类
         }
         if (ctx_a) {
-            init_audio();
+            init_audio();   // 确定audio_preproc 的具体实例子类
         }
     }
 
@@ -619,15 +636,16 @@ struct mtmd_tokenizer {
 
     // tokenize
     int32_t tokenize(mtmd_input_chunks * output) {
+        // 清空当前输入 chunk 列表
         cur.entries.clear();
-
-        // 1. 拆分
         
         // 把输入拆分成类似 [text, media_marker, text, media_marker, text]
         std::vector<std::string> parts = split_text(input_text, ctx->media_marker);
         // 记录当前要取的位图索引
         size_t i_bm = 0; // index of the current bitmap
         
+
+        // 处理 media 或 text
         for (auto & part : parts) {
             
             // 如果当前 part 是 media_marker，走 media 处理
@@ -642,23 +660,45 @@ struct mtmd_tokenizer {
                 // 取出当前这张 bitmap，索引 + 1
                 // 对这张 bitmap 走 add_media() 处理
                 const mtmd_bitmap * bitmap = bitmaps[i_bm++];
+                
+                // add_media 会预处理 bitmap，包含：
+                //      添加img_beg、img_end token（属于 text chunk）
+                //      resize
+                //      归一化
+                //      加入位置信息
+                //      将 image chunk 加入到 mtmd_input_chunks 类型的 cur 对象中
                 int32_t res = add_media(bitmap);
+                
+                // 如果发生错误（!=0），返回错误代码
                 if (res != 0) {
                     return res;
                 }
-            } else {
+            } 
+            
+            // 如果当前 part 不是 media_marker，走 text 处理
+            else {
                 // this is a text part, we should add it as text
                 add_text(part, parse_special);
             }
         }
+        
 
+        // 为整体的输入 chunk 列表增加 BOS、EOS
+
+        // 如果 add_special = true 且词表允许自动加 BOS
         if (add_special && llama_vocab_get_add_bos(vocab)) {
             // if first chunk is text, we add BOS token to first text chunk
             // otherwise, create a new text chunk with BOS token
+            
+            // 如果当前已有 chunk 且第一个 chunk 是 text 类型
+            // 在第一个 text chunk 最前面插入 BOS token
             if (!cur.entries.empty() && cur.entries[0].type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
                 // add BOS token to the beginning of first text chunk
                 cur.entries[0].tokens_text.insert(cur.entries[0].tokens_text.begin(), llama_vocab_bos(vocab));
-            } else {
+            } 
+            
+            // 否则，单独创建一个只包含 BOS 的 text chunk，插入到输入 chunk 列表的最前面
+            else {
                 // create a new text chunk with BOS token at the beginning
                 mtmd_input_chunk bos_chunk{
                     MTMD_INPUT_CHUNK_TYPE_TEXT,
@@ -669,7 +709,9 @@ struct mtmd_tokenizer {
                 cur.entries.insert(cur.entries.begin(), std::move(bos_chunk));
             }
         }
-
+        
+        // 如果 add_special = true 且词表允许自动加 EOS
+        // 复用 add_text，将 EOS 加入输入 chunk 列表
         if (add_special && llama_vocab_get_add_eos(vocab)) {
             // if last chunk is text, we add EOS token to it
             add_text({llama_vocab_eos(vocab)});
@@ -680,7 +722,8 @@ struct mtmd_tokenizer {
                     __func__, bitmaps.size(), parts.size() - 1);
             return 1;
         }
-
+        
+        // 把 chunk 列表结果传递给传递进来的 output
         *output = std::move(cur);
 
         return 0;
@@ -710,6 +753,7 @@ struct mtmd_tokenizer {
                 nullptr, // image tokens
                 nullptr, // audio tokens
             };
+            // 把 chunk 加入 entries
             cur.entries.emplace_back(std::move(chunk));
         }
     }
@@ -719,21 +763,27 @@ struct mtmd_tokenizer {
         if (!bitmap->is_audio) {
             // handle image
 
+            // 如果缺少视觉上下文，报错并返回 2
             if (!ctx->ctx_v) {
                 LOG_ERR("%s: error: model does not support vision input\n", __func__);
                 return 2;
             }
-
+            
+            // 如果 ctx 的图像起始 token img_beg 非空，调用 add_text()
+            // 把 img_beg 的 token id 加入 text chunk
             if (!ctx->img_beg.empty()) {
                 add_text(ctx->img_beg, true); // add image begin token
             }
 
             // sanity check
-            GGML_ASSERT(bitmap->nx > 0 && bitmap->ny > 0);
-            GGML_ASSERT(bitmap->data.size() == (size_t)bitmap->nx * bitmap->ny * 3);
-            GGML_ASSERT(ctx->image_preproc != nullptr);
+            GGML_ASSERT(bitmap->nx > 0 && bitmap->ny > 0);  // 检查 nx、ny 大于 0
+            GGML_ASSERT(bitmap->data.size() == (size_t)bitmap->nx * bitmap->ny * 3);    // 检查data 形状正确
+            GGML_ASSERT(ctx->image_preproc != nullptr);     // 检查图像处理器不为空
 
             // convert mtmd_bitmap to clip_image_u8
+            // 将 mtmd_bitmap 的图像转换为 clip_image_u8 格式
+            // 即，图像表示从 std::vector<unsigned char> 的 mtmd_bitmap.data
+            // 转换成 std::vector<uint8_t> 的 clip_image_u8.buf
             clip_image_u8_ptr img_u8(clip_image_u8_init());
             img_u8->nx = bitmap->nx;
             img_u8->ny = bitmap->ny;
@@ -741,14 +791,29 @@ struct mtmd_tokenizer {
             std::memcpy(img_u8->buf.data(), bitmap->data.data(), img_u8->nx * img_u8->ny * 3);
 
             // preprocess image
+            // 存储当前这一次 add_media() 对单个 bitmap 做预处理后的结果集合
+            // 对 Qwen3VL / dyn_size 路径，通常只有 1 个 entry
+            // 对 llava-uhd / idefics3 / lfm2 / step3vl 等切片类预处理，可能包含多张 overview/slices/tiles
             clip_image_f32_batch batch_f32;
+
+            // Qwen2VL、Qwen25VL、Qwen3VL 用 mtmd_image_preprocessor_dyn_size
+            // mtmd_image_preprocessor_dyn_size 通常 batch_f32 内只存储 1 个 bitmap 的数据
+
+            // 将 clip_image_u8 的图像转换为 clip_image_f32 格式
+            // 即，图像表示从 std::vector<uint8_t> 的 clip_image_u8.buf
+            // 转换成 std::vector<float> 的 clip_image_f32.buf
             bool ok = ctx->image_preproc->preprocess(*img_u8, batch_f32);
+            
+            // 如果图像预处理失败，报错
             if (!ok) {
                 LOG_ERR("Unable to preprocess image\n");
                 return 2;
             }
 
             // handle llava-uhd style preprocessing
+            // llava-uhd style 风格的图像预处理方式，会把图像切分成多个局部 tiles
+            // Qwen3VL 不走该分支
+            // Qwen3VL 没有设置 slice_tmpl，其默认值为 MTMD_SLICE_TMPL_NONE
             const bool has_tiling_grid = batch_f32.grid_x > 0 && batch_f32.grid_y > 0;
             if (
                 ctx->slice_tmpl == MTMD_SLICE_TMPL_MINICPMV_2_5
@@ -811,22 +876,37 @@ struct mtmd_tokenizer {
                     add_text(ctx->tok_ov_img_end);
                 }
 
-            } else {
+            } 
+            
+            // Qwen3VL 默认走该分支，即把整张预处理的图作为一个 image chunk 保存
+            else {
                 size_t n_tokens = 0;
+
+                // 计算 batch_f32.entries 中所有图像会产出的 vision token 数量
                 for (const auto & entry : batch_f32.entries) {
                     n_tokens += clip_n_output_tokens(ctx->ctx_v, entry.get());
                 }
 
+                // 创建 image_tokens 对象，指向 mtmd_image_tokens，用于记录 vision token 位置等信息
                 mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+                
+                // mtmd_decode_use_mrope(ctx) 获取 ctx->pos_type
+                // 判断是否要按 M-RoPE 形式保存二维 vision token 位置信息
                 if (mtmd_decode_use_mrope(ctx)) {
                     // for Qwen2VL, we need this information for M-RoPE decoding positions
+                    // 分别获取 x 轴、y轴上的 token 数
                     image_tokens->nx = clip_n_output_tokens_x(ctx->ctx_v, batch_f32.entries[0].get());
                     image_tokens->ny = clip_n_output_tokens_y(ctx->ctx_v, batch_f32.entries[0].get());
-                } else {
+                } 
+                
+                // 如果不是 M-PoPE，则位置信息退化到一维（x 轴）
+                else {
                     // other models, we only need the total number of tokens
                     image_tokens->nx = n_tokens;
                     image_tokens->ny = 1;
                 }
+
+                // 保存位置编码信息、图像信息、bitmap->id（用于 kv cache）
                 image_tokens->pos = ctx->pos_type;
                 image_tokens->batch_f32 = std::move(batch_f32);
                 image_tokens->id = bitmap->id; // optional
@@ -834,7 +914,9 @@ struct mtmd_tokenizer {
                 LOG_DBG("image_tokens->nx = %d\n", image_tokens->nx);
                 LOG_DBG("image_tokens->ny = %d\n", image_tokens->ny);
                 LOG_DBG("batch_f32 size = %d\n", (int)image_tokens->batch_f32.entries.size());
+                
 
+                // 创建 image 类型的 chunk，并加入 cur.entries
                 mtmd_input_chunk chunk{
                     MTMD_INPUT_CHUNK_TYPE_IMAGE,
                     {}, // text tokens
@@ -844,6 +926,8 @@ struct mtmd_tokenizer {
                 cur.entries.emplace_back(std::move(chunk));
             }
 
+            // 如果 ctx 的图像结束 token img_end 非空，调用 add_text()
+            // 把 img_end 的 token id 加入 text chunk
             if (!ctx->img_end.empty()) {
                 add_text(ctx->img_end, true); // add image end token
             }
@@ -1005,16 +1089,23 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
 }
 
 int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
+    // 传入 text chunk，报错
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         LOG_WRN("mtmd_encode_chunk has no effect for text chunks\n");
         return 0;
-    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+    } 
+    
+    // 传入 image chunk，调用 mtmd_encode 处理
+    else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
         if (!ctx->ctx_v) {
             LOG_ERR("%s: model does not support vision input\n", __func__);
             return 1;
         }
         return mtmd_encode(ctx, chunk->tokens_image.get());
-    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+    } 
+    
+    // 传入 audio chunk
+    else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
         if (!ctx->ctx_a) {
             LOG_ERR("%s: model does not support audio input\n", __func__);
             return 1;
@@ -1034,16 +1125,26 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
 }
 
 int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {
+    // 取视觉上下文，为空则报错
     clip_ctx * ctx_clip = ctx->ctx_v;
     if (!ctx_clip) {
         LOG_ERR("%s: this API does not support non-vision input, please use mtmd_encode_chunk instead\n", __func__);
         return 1;
     }
+
+    // 读取 projector 类型
     auto proj_type = clip_get_projector_type(ctx_clip);
+
+    // 读取 projector 的输入维度
+    // 在 Qwen3.5-0.8B 中，n_mmproj_embd = 1024
+    // projector 是 Linear(3072, 3072) + GELU + Linear(3072, 1024)
     int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
+
+    // 设置展平的 image embedding vector，大小为 vision token 数 * projector_emdb
     ctx->image_embd_v.resize(image_tokens->n_tokens() * n_mmproj_embd);
     bool ok = false;
 
+    // 编码分支：llava / minicpmv / glm / internvl
     if (clip_is_llava(ctx_clip)
         || clip_is_minicpmv(ctx_clip)
         || clip_is_glm(ctx_clip)
@@ -1058,12 +1159,16 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
                 entries[i].get(),
                 ctx->image_embd_v.data() + i*n_mmproj_embd*n_tokens_per_image);
         }
-    } else {
+    } 
+    
+    // 通用编码分支
+    // Qwen3VL 走该分支
+    else {
         ok = clip_image_batch_encode(
-            ctx_clip,
-            ctx->n_threads,
-            &image_tokens->batch_f32,
-            ctx->image_embd_v.data());
+            ctx_clip,                   // clip 上下文
+            ctx->n_threads,             // 线程数
+            &image_tokens->batch_f32,   // image_tokens 对应的 bitmap 派生出的所有图像（Qwen3VL只有1张）
+            ctx->image_embd_v.data());  // image embedding vector
     }
 
     return ok ? 0 : 1;
@@ -1220,11 +1325,11 @@ const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chu
 }
 
 size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
-    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {            // text chunk 的 token 数
         return chunk->tokens_text.size();
-    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {    // image chunk 的 token 数
         return mtmd_image_tokens_get_n_tokens(chunk->tokens_image.get());
-    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+    } else if (chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {    // audio chunk 的 token 数
         return chunk->tokens_audio->n_tokens;
     } else {
         GGML_ABORT("invalid chunk type");

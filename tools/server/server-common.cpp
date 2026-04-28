@@ -871,7 +871,14 @@ static void handle_media(
         std::vector<raw_buffer> & out_files,
         json & media_obj,
         const std::string & media_path) {
+    
+    // 获取图片的 url
     std::string url = json_value(media_obj, "url", std::string());
+
+    // 针对以下 3 种类型的图片 url，对图片进行解码并存入 out_files：
+    // (1) 远程图片url  (2) 本地图片url  (3) base64图片url
+
+    // 对于 http 开头的远程图片，调用 common_remote_get_content 下载，限制最大 10MB、最长 10s
     if (string_starts_with(url, "http")) {
         // download remote image
         // TODO @ngxson : maybe make these params configurable
@@ -889,11 +896,16 @@ static void handle_media(
             throw std::runtime_error("Failed to download image");
         }
 
-    } else if (string_starts_with(url, "file://")) {
+    } 
+    
+    // 对于本地图片
+    else if (string_starts_with(url, "file://")) {
+        // 必须启动 --media-path，否则报错
         if (media_path.empty()) {
             throw std::invalid_argument("file:// URLs are not allowed unless --media-path is specified");
         }
         // load local image file
+        // 去掉 "file://"，检查文件名合法性
         std::string file_path = url.substr(7); // remove "file://"
         raw_buffer data;
         if (!fs_validate_filename(file_path, true)) {
@@ -907,7 +919,13 @@ static void handle_media(
         data.assign((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         out_files.push_back(data);
 
-    } else {
+    } 
+    
+    // 对于内联的 base64 图片，必须满足：
+    // 1. url 能够按照 "," 拆成两段
+    // 2. 前半段必须以 "data:image/" 开头、"base64"结尾
+    // 然后对后半段进行 base64 解码
+    else {
         // try to decode base64 image
         std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
         if (parts.size() != 2) {
@@ -932,11 +950,14 @@ json oaicompat_chat_params_parse(
 {
     json llama_params;
 
+    // 读取请求体中的 tools、stream、tool_choice 对应的 value
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
 
+    // 如果没有启用 jinja 且（请求里有 tools 或 tool_choice != choice），则报错
+    // 即工具调用依赖 jinja chat template
     if (!opt.use_jinja) {
         if (has_tools) {
             throw std::runtime_error("tools param requires --jinja flag");
@@ -947,77 +968,140 @@ json oaicompat_chat_params_parse(
     }
 
     // Handle "stop" field
+    // OpenAI API /chat/completions 请求体里的 stop 指 LLM 停止生成的字符
+
+    //如果 body 包含 stop 字段且 stop 字段 value 是字符串，则写入 llama_params["stop"]
     if (body.contains("stop") && body.at("stop").is_string()) {
+        // 传入的是数组，值为 string 类型的 stop 字段值
         llama_params["stop"] = json::array({body.at("stop").get<std::string>()});
-    } else {
+    } else {    // 否则，原样取出 stop 内容或空数组，并写入
         llama_params["stop"] = json_value(body, "stop", json::array());
     }
 
+    // OpenAI API /chat/completions 请求体里的
+    // json_schema：强制模型输出指定 json 格式（更高层）
+    // grammar：强制模型生成的 token 必须符合某种文法（更底层）
     auto json_schema = json_value(body, "json_schema", json());
     auto grammar = json_value(body, "grammar", std::string());
+
+    // 二者不可同时存在，否则报错
     if (!json_schema.is_null() && !grammar.empty()) {
         throw std::runtime_error("Cannot use both json_schema and grammar");
     }
 
     // Handle "response_format" field
+    // OpenAI API /chat/completions 请求体里的
+    // response_format：指定的输出格式，属于 json_schema 的上一级 json
+    //                  type 字段取值为 text（无约束）、json_object（中等json约束）、json_schema（强json约束）
     if (body.contains("response_format")) {
         json response_format      = json_value(body, "response_format", json::object());
         std::string response_type = json_value(response_format, "type", std::string());
+        // type = json_object
+        // 把 response_format.schema 放进 json_schema
         if (response_type == "json_object") {
             json_schema = json_value(response_format, "schema", json::object());
-        } else if (response_type == "json_schema") {
+        } 
+        
+        // type = json_schema
+        // 把 response_format.json_schema.schema 放进 json_schema
+        else if (response_type == "json_schema") {
             auto schema_wrapper = json_value(response_format, "json_schema", json::object());
             json_schema = json_value(schema_wrapper, "schema", json::object());
-        } else if (!response_type.empty() && response_type != "text") {
+        } 
+        
+        // type 非法取值，报错（type = text，允许，不执行操作）
+        else if (!response_type.empty() && response_type != "text") {
             throw std::invalid_argument("response_format type must be one of \"text\" or \"json_object\", but got: " + response_type);
         }
     }
 
     // get input files
+    // 如果缺少 message 字段，报错
     if (!body.contains("messages")) {
         throw std::invalid_argument("'messages' is required");
     }
+
+    // 如果 message 字段的值不是数组，报错
     json & messages = body.at("messages");
     if (!messages.is_array()) {
         throw std::invalid_argument("Expected 'messages' to be an array");
     }
+
+    // 逐个遍历 messages 内的每个 msg，进行合法性检查
     for (auto & msg : messages) {
+        // 获取 role 字段的值
         std::string role = json_value(msg, "role", std::string());
+        // 如果 role 字段的值不是 assistant 且不包含 content 字段，报错
         if (role != "assistant" && !msg.contains("content")) {
             throw std::invalid_argument("All non-assistant messages must contain 'content'");
         }
+        // 如果 role == assistant
         if (role == "assistant") {
+            // 同时缺少 content、tool_calls，报错
             if (!msg.contains("content") && !msg.contains("tool_calls")) {
                 throw std::invalid_argument("Assistant message must contain either 'content' or 'tool_calls'!");
             }
+            // 有 tool_calls、缺少 content，跳过处理
             if (!msg.contains("content")) {
                 continue; // avoid errors with no content
             }
         }
+
+        // 获取 msg.content
+        /* OPenAI API 新版本（多模态）的格式为：
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "这张图里有什么？"},
+                {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.com/cat.jpg"
+                    }
+                }
+            ]
+        }
+        */
         json & content = msg.at("content");
+
+        // content 是字符串或为空，跳过
+        // 适用于旧版 API，非多模态
         if (content.is_string() || content.is_null()) {
             continue;
         }
 
-        if (!content.is_array()) {
+        // content 不是数组（也不是字符串或不为空），报错
+        if (!content.is_array()) {      
             throw std::invalid_argument("Expected 'content' to be a string or an array");
         }
 
+        // 新版 API，多模态
+        // 此时 content 字段类型是数组，逐个遍历数组内的每条消息 p
         for (auto & p : content) {
+            // 获取 p 的类型
             std::string type      = json_value(p, "type", std::string());
+            
+            // 对于 image 类型
             if (type == "image_url") {
+                // 如果模型不允许图片输入，则报错
                 if (!opt.allow_image) {
                     throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
                 }
-
+                
+                // 获取图片 image_url
                 json image_url = json_value(p, "image_url", json::object());
+                // 获取图片并存入 out_files
                 handle_media(out_files, image_url, opt.media_path);
+                
+                // 修改 content 的元素 p
+                p["type"] = "media_marker";         // type 改成 media_marker
+                p["text"] = get_media_marker();     // 新增 text 字段
+                p.erase("image_url");               // 删除 image_url 字段
 
-                p["type"] = "media_marker";
-                p["text"] = get_media_marker();
-                p.erase("image_url");
-
-            } else if (type == "input_audio") {
+            } 
+            
+            // 对于 audio 类型
+            else if (type == "input_audio") {
                 if (!opt.allow_audio) {
                     throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
                 }
@@ -1044,6 +1128,8 @@ json oaicompat_chat_params_parse(
         }
     }
 
+
+    // 把 OpenAI 格式转的一些内容写入 common_chat_templates_inputs 格式的 inputs
     common_chat_templates_inputs inputs;
     inputs.messages              = common_chat_msgs_parse_oaicompat(messages);
     inputs.tools                 = common_chat_tools_parse_oaicompat(tools);
@@ -1053,26 +1139,35 @@ json oaicompat_chat_params_parse(
     inputs.use_jinja             = opt.use_jinja;
     inputs.parallel_tool_calls   = json_value(body, "parallel_tool_calls", false);
     inputs.add_generation_prompt = json_value(body, "add_generation_prompt", true);
+    // 推理模型相关配置
     inputs.reasoning_format      = opt.reasoning_format;
     if (body.contains("reasoning_format")) {
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
     }
     inputs.enable_thinking       = opt.enable_thinking;
+    
+    // 如果当前请求里有 tools 且 tool_choice 不是 none，说明模型输出可能包含 tool_calss
+    // 此时不允许传入 grammar，因为工具调用本身也会生成 grammar 约束
     if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
         if (body.contains("grammar")) {
             throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
         }
-        llama_params["parse_tool_calls"] = true;
+        llama_params["parse_tool_calls"] = true;    // 设置成解析 tool calls 的模式
     }
 
     // merge the template args provided from command line with the args provided in the user request
+    // 处理当前请求里的 chat_template_kwargs
+    // 获取请求里的 chat_template_kwargs 字段内容
     auto chat_template_kwargs_object = json_value(body, "chat_template_kwargs", json::object());
+    // 获取命令行的 chat_template_kwargs 字段内容
     inputs.chat_template_kwargs = opt.chat_template_kwargs;
+    // 如果同名，请求里的字段值 ---覆盖---> 命令行中的字段值
     for (const auto & item : chat_template_kwargs_object.items()) {
         inputs.chat_template_kwargs[item.key()] = item.value().dump();
     }
 
     // parse the "enable_thinking" kwarg to override the default value
+    // 根据当前请求里的 "enable_thinking" 字段值，决定是否打开 thinking 模式
     auto enable_thinking_kwarg = json_value(inputs.chat_template_kwargs, "enable_thinking", std::string(""));
     if (enable_thinking_kwarg == "true") {
         inputs.enable_thinking = true;
@@ -1082,34 +1177,49 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
+
     // if the assistant message appears at the end of list, we do not add end-of-turn token
     // for ex. this can be useful to modify the reasoning process in reasoning models
+    
+    // 处理 assistant prefill： 请求最后一条（仅能有一条）消息已经是 assistant，
+    //                          并且用户希望模型从这段 assistant 内容后面继续生成，
+    //                          而不是把它当成一轮完整 assistant 回复
+    
+    // 如果 （inputs.messages不为空）&&（最后一条msg.role是assistant）&&（opt.prefill_assistant=true）
     bool prefill_assistant_message = !inputs.messages.empty() && inputs.messages.back().role == "assistant" && opt.prefill_assistant;
     common_chat_msg last_message;
     if (prefill_assistant_message) {
+        // 获取最后一条 msg，并从 messages 中删除
         last_message = inputs.messages.back();
         inputs.messages.pop_back();
 
         /* sanity check, max one assistant message at the end of the list */
+        // 末尾有 1 条以上的 msg 是 assistant，报错，不能使用 assistant prefill
         if (!inputs.messages.empty() && inputs.messages.back().role == "assistant"){
             throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
         }
 
         /* TODO: test this properly */
+        // prefill 时强制执行
         inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
 
         if ( inputs.enable_thinking ) {
             throw std::invalid_argument("Assistant response prefill is incompatible with enable_thinking.");
         }
 
+        // prefill 时强制执行
         inputs.add_generation_prompt = true;
     }
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
-    auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    // 应用chat template，生成最终 prompt
 
+    // 用 common_chat_params 类型的 chat_params 保存 prompt
+    auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);    // .get()取出智能指针的裸指针，但不转移所有权
     /* Append assistant prefilled message */
+    // 如果 prefill_assistant_message=true
+    // 则需要对刚才拿出的 last_message 进行处理，加入到 chat_params.prompt 中
     if (prefill_assistant_message) {
         if (!last_message.content_parts.empty()) {
             for (auto & p : last_message.content_parts) {
@@ -1120,6 +1230,7 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // 把 chat_params 写回 json 的 llama_params
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
     if (!chat_params.grammar.empty()) {
@@ -1171,6 +1282,7 @@ json oaicompat_chat_params_parse(
     // Copy remaining properties to llama_params
     // This allows user to use llama.cpp-specific params like "mirostat", ... via OAI endpoint.
     // See "launch_slot_with_task()" for a complete list of params supported by llama.cpp
+    // 从请求体中复制剩余参数到 json 的 llama_params 中
     for (const auto & item : body.items()) {
         // Exception: if "n_predict" is present, we overwrite the value specified earlier by "max_tokens"
         if (!llama_params.contains(item.key()) || item.key() == "n_predict") {

@@ -224,6 +224,7 @@ struct common_chat_templates {
     bool add_bos;
     bool add_eos;
     bool has_explicit_template;  // Model had builtin template or template overridden was specified.
+    // 保存默认模板 template_default 和工具调用模板 template_tool_use
     std::unique_ptr<common_chat_template> template_default;  // always set (defaults to chatml)
     std::unique_ptr<common_chat_template> template_tool_use;
 };
@@ -2134,6 +2135,8 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
                                                             const struct common_chat_templates_inputs & inputs) {
     autoparser::generation_params params;
     params.tools = common_chat_tools_to_json_oaicompat(inputs.tools);
+    
+    // 如果 params.tools
     const auto & tmpl =
         params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
     const auto & src        = tmpl.source();
@@ -2307,7 +2310,9 @@ static common_chat_params common_chat_templates_apply_legacy(const struct common
 
 common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                const struct common_chat_templates_inputs & inputs) {
-    GGML_ASSERT(tmpls != nullptr);
+    
+    // 根据 inputs.use_jinja，决定生成 chat_template 的逻辑
+                                                GGML_ASSERT(tmpls != nullptr);
     return inputs.use_jinja ? common_chat_templates_apply_jinja(tmpls, inputs) :
                               common_chat_templates_apply_legacy(tmpls, inputs);
 }

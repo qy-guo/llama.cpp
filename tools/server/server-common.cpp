@@ -1129,6 +1129,8 @@ json oaicompat_chat_params_parse(
     }
 
 
+    // common_chat_templates_inputs 类型用于存储 chat template 渲染前的输入
+
     // 把 OpenAI 格式转的一些内容写入 common_chat_templates_inputs 格式的 inputs
     common_chat_templates_inputs inputs;
     inputs.messages              = common_chat_msgs_parse_oaicompat(messages);
@@ -1187,6 +1189,7 @@ json oaicompat_chat_params_parse(
     
     // 如果 （inputs.messages不为空）&&（最后一条msg.role是assistant）&&（opt.prefill_assistant=true）
     bool prefill_assistant_message = !inputs.messages.empty() && inputs.messages.back().role == "assistant" && opt.prefill_assistant;
+    
     common_chat_msg last_message;
     if (prefill_assistant_message) {
         // 获取最后一条 msg，并从 messages 中删除
@@ -1213,9 +1216,12 @@ json oaicompat_chat_params_parse(
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
-    // 应用chat template，生成最终 prompt
-
-    // 用 common_chat_params 类型的 chat_params 保存 prompt
+    // common_chat_params 类型的 chat_params 是一次 chat template 应用后的完整产物
+    // 既包含给模型看的 prompt，也包含后续生成约束、停止条件、thinking 信息和输出解析规则
+    
+    // common_chat_templates_apply 传入：
+    // 1）opt.tmpls.get()：指向全局配置 opt 内、包含已经编译好的 chat template 的 tmpls
+    // 2）inputs：存储的 chat template 渲染前的输入
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);    // .get()取出智能指针的裸指针，但不转移所有权
     /* Append assistant prefilled message */
     // 如果 prefill_assistant_message=true

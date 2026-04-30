@@ -70,20 +70,36 @@ static bool has_content_or_tool_calls(const common_chat_msg & msg) {
     return !msg.content.empty() || !msg.tool_calls.empty();
 }
 
+// 根据 content、content_parts 是否为空（分别对应旧版、新版的 OpenAI Chat 格式，即 content 的类型），
+// 结合 concat_typed_text，将输入 inputs.messages 每个元素的 content 和部分 tools 相关的内容读取成适合 jinja 模板的 json 格式
+// concat_typed_text：当前 jinja 模板是否仅支持处理 string 类型的 content
 json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
+    
     if (!content.empty() && !content_parts.empty()) {
         throw std::runtime_error("Cannot specify both content and content_parts");
     }
     json jmsg {
         {"role", role},
     };
+
+    // 如果 msg.content 不为空，则把 content 传进去
+    // （content对应的是前面的旧版 OpenAI Chat API，即 content 字段是 string 类型）
     if (!content.empty()) {
         jmsg["content"] = content;
-    } else if (!content_parts.empty()) {
+    } 
+    
+    // 如果 msg.content 为空且 content_parts 不为空
+    // （content对应的是前面的新版 OpenAI Chat API，即 content 字段是数组类型）
+    else if (!content_parts.empty()) {
+        
+        // concat_typed_text = true：当前 jinja 仅支持 string 类型的 content
+        // 因此，需要将数组类型的 content 字段内容变为 string
         if (concat_typed_text) {
             std::string text;
             bool last_was_media_marker = false;
             // join parts with newline, do not add newline before or after media markers
+            // 遍历 messages 中的每条 msg 的数组类型 content
+            // 每个 msg 的 content 之间加换行符，media_markers 类型后面不加
             for (const auto & part : content_parts) {
                 bool add_new_line = true;
                 if (part.type == "text") {
@@ -103,9 +119,14 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
 
                 text += part.text;
             }
+            // 以 string 形式写入 text
             jmsg["content"] = text;
-        } else {
+        } 
+        
+        // concat_typed_text = false：当前 jinja 天然支持数组类型的 content
+        else {
             auto & parts = jmsg["content"] = json::array();
+            // 逐个遍历 content_parts 内容并写入 parts
             for (const auto & part : content_parts) {
                 parts.push_back({
                     {"type", part.type},
@@ -113,9 +134,14 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
                 });
             }
         }
-    } else {
+    } 
+    
+    // msg.content 和 content_parts 都为空，返回空 string
+    else {
         jmsg["content"] = "";
     }
+
+    // 从 chat template 的输入 inputs 中读取信息，转换成合适的格式并加入 jmsg
     if (!reasoning_content.empty()) {
         jmsg["reasoning_content"] = reasoning_content;
     }
@@ -224,7 +250,8 @@ struct common_chat_templates {
     bool add_bos;
     bool add_eos;
     bool has_explicit_template;  // Model had builtin template or template overridden was specified.
-    // 保存默认模板 template_default 和工具调用模板 template_tool_use
+    
+    // 默认模板 template_default 和工具调用模板 template_tool_use 的智能指针
     std::unique_ptr<common_chat_template> template_default;  // always set (defaults to chatml)
     std::unique_ptr<common_chat_template> template_tool_use;
 };
@@ -358,20 +385,32 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
     return msgs;
 }
 
+
+// 根据 content、content_parts 是否为空（分别对应旧版、新版的 OpenAI Chat 格式，即 content 的类型），
+// 处理 msgs 内每个元素的 content 和部分 tools 相关的内容读取成适合 jinja 模板的 json 格式
 static json render_message_to_json(const std::vector<common_chat_msg> & msgs, const jinja::caps & c) {
     if (!c.supports_string_content && !c.supports_typed_content) {
         LOG_WRN("%s: Neither string content nor typed content is supported by the template. This is unexpected and may lead to issues.\n", __func__);
     }
 
+    // 当前 jinja 模板是否仅支持 string 类型的 msg.content
     bool only_string_accepted =  c.supports_string_content && !c.supports_typed_content;
+    // 当前 jinja 模板是否仅支持数组类型的 msg.content，其中内部字段包含 "type" 和 "text"
     bool only_typed_accepted  = !c.supports_string_content &&  c.supports_typed_content;
 
     json messages = json::array();
+
+    // 逐个遍历 msgs 数组内的每条 common_chat_msg 类型的消息
     for (const auto & msg : msgs) {
+        // 如果仅支持 string 类型的 content
         if (only_string_accepted) {
-            json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ true);
+            jons jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ true);
             messages.push_back(jmsg);
-        } else if (only_typed_accepted) {
+        } 
+        
+        // 如果仅支持数组类型的 content
+        else if (only_typed_accepted) {
+            // inputs.messages 每个元素的 content 和部分 tools 相关的内容读取成适合 jinja 模板的 json 格式
             json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false);
             if (jmsg.at("content").is_string()) {
                 jmsg["content"] = json::array({
@@ -382,7 +421,11 @@ static json render_message_to_json(const std::vector<common_chat_msg> & msgs, co
                 });
             }
             messages.push_back(jmsg);
-        } else {
+        } 
+        
+        // 如果都为 false，直接调用 to_json_oaicompat()，
+        // 让其根据 content、content_parts 是否为空自行判断
+        else {
             json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false);
             messages.push_back(jmsg);
         }
@@ -765,52 +808,78 @@ static void foreach_parameter(const json &                                      
     }
 }
 
+// 传入 chat template 和 jinja 渲染所需的输入，输出渲染后的 prompt 字符串
 static std::string common_chat_template_direct_apply_impl(
-    const common_chat_template & tmpl,
-    const autoparser::generation_params & inputs,
-    const std::optional<json> & messages_override = std::nullopt,
-    const std::optional<json> & tools_override = std::nullopt,
-    const std::optional<json> & additional_context = std::nullopt) {
-    jinja::context ctx(tmpl.source());
+    const common_chat_template & tmpl,                              // 解析好的 chat template
+    const autoparser::generation_params & inputs,                   // jinja 渲染所需的输入，例如 messages 等
+    const std::optional<json> & messages_override = std::nullopt,   // 可选，用于临时替换 inputs.messages
+    const std::optional<json> & tools_override = std::nullopt,      // 可选，用于临时替换 inputs.tools
+    const std::optional<json> & additional_context = std::nullopt) {// 可选，用于临时注入 template 的额外变量
 
+    // 把一个 jinja chat template 渲染成 prompt 字符串
+
+    // 用 string 的源字符串，创建 jinja 上下文
+    jinja::context ctx(tmpl.source());
+    
+
+    // 构造 jinja 模板能访问的变量 inp
+
+    // inp 注入 messages 信息
     nlohmann::ordered_json inp = nlohmann::ordered_json{
+        // messages 优先考虑 messages_override
         {"messages", messages_override.has_value() ? *messages_override : inputs.messages},
         {"bos_token", tmpl.bos_token()},
         {"eos_token", tmpl.eos_token()},
         {"enable_thinking", inputs.enable_thinking},
     };
+
+    // inp 注入 tools 信息
     if (tools_override.has_value() || !inputs.tools.empty()) {
+        // tools 优先考虑 tools_override
         inp["tools"] = tools_override.has_value() ? *tools_override : inputs.tools;
     }
+
+    // inp 注入 chat_template_kwargs
     if (inputs.extra_context.is_object()) {
         // TODO: do we need to merge, or replacing is fine?
         for (const auto & [k, v] : inputs.extra_context.items()) {
             inp[k] = v;
         }
     }
+
+    // inp 注入额外的临时上下文
     if (additional_context.has_value()) {
         // TODO: merge properly instead of overwriting (matching old behavior)
         for (const auto & [k, v] : additional_context->items()) {
             inp[k] = v;
         }
     }
+
+    // inp 注入 add_generation_prompt
     if (inputs.add_generation_prompt) {
         inp["add_generation_prompt"] = true;
     }
 
+    // 把 json 格式的 inp 变量注册仅 jinja 上下文 ctx
     jinja::global_from_json(ctx, inp, inputs.mark_input);
 
     // render
+    // 执行 jinja 模板，将 inp 变量填入 jinja chat template ，并渲染成 prompt 字符串
     jinja::runtime runtime(ctx);
     const jinja::value results = runtime.execute(tmpl.prog);
+    
+    // 收集 jinja 执行结果（可能是多个字符串片段）
     auto parts = jinja::runtime::gather_string_parts(results);
-
+    // 合并后将最终的字符串 prompt 保存到 result 中
     std::string result = parts->as_string().str();
 
     // TODO: improve this later
+    // 对 BOS 和 EOS 进行去重
+    // 如果 inputs.add_bos = true 且渲染的 prompt 开头已有 BOS token，则去除已有的
     if (inputs.add_bos && string_starts_with(result, tmpl.bos_token())) {
         result = result.substr(tmpl.bos_token().size());
     }
+    // EOS token 与 BOS token 同理
     if (inputs.add_eos && string_ends_with(result, tmpl.eos_token())) {
         result = result.substr(0, result.size() - tmpl.eos_token().size());
     }
@@ -2133,32 +2202,52 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
 
 static common_chat_params common_chat_templates_apply_jinja(const struct common_chat_templates *        tmpls,
                                                             const struct common_chat_templates_inputs & inputs) {
+    
+    // 用于解析的控制台，包含多个参数
     autoparser::generation_params params;
+    
+    // 将 inputs 的 tools 处理格式后加入 params
     params.tools = common_chat_tools_to_json_oaicompat(inputs.tools);
     
-    // 如果 params.tools
+    // 如果有工具信息 and 全局 chat 配置中的 tool use 模板不为空，tmpl 指向 tool use 模板
+    // 否则，tmpl 指向默认模板
     const auto & tmpl =
         params.tools.is_array() && tmpls->template_tool_use ? *tmpls->template_tool_use : *tmpls->template_default;
-    const auto & src        = tmpl.source();
-    const auto & caps       = tmpl.original_caps();
+    const auto & src        = tmpl.source();            // tmpl 内的字符串原输入
+    const auto & caps       = tmpl.original_caps();     // tmpl 内 jinja 模板的能力
+    
+    // 根据 content、content_parts 是否为空（分别对应旧版、新版的 OpenAI Chat 格式，即 content 的类型），
+    // 处理 msgs 内每个元素的 content 和部分 tools 相关的内容读取成适合 jinja 模板的 json 格式，
+    // 加入 params
     params.messages         = render_message_to_json(inputs.messages, tmpl.original_caps());
+    
+    // 继续写入 inputs 内的相关信息
     params.tool_choice      = inputs.tool_choice;
     params.reasoning_format = inputs.reasoning_format;
     params.enable_thinking  = inputs.enable_thinking;
     params.grammar          = inputs.grammar;
     params.now              = inputs.now;
+    
+    // 写入全局 chat 信息的"是否加入 BOS 和 EOS token"
     params.add_bos          = tmpls->add_bos;
     params.add_eos          = tmpls->add_eos;
 
-    if (src.find("<|channel|>") == std::string::npos) {
+
+    // 对一些模板进行兼容修正
+
+    // 除了 GPT-OSS 这类带 <|channel|> 的模板，对其他模型把 developer role 映射成 system role
+    if (src.find("<|channel|>") == std::string::npos) {     // 如果没找到 "<|channel|>"
         // map developer to system for all models except for GPT-OSS
         workaround::map_developer_role_to_system(params.messages);
     }
 
+    // 如果模板不支持 system role，做兼容处理
     if (!tmpl.original_caps().supports_system_role) {
         workaround::system_message_not_supported(params.messages);
     }
 
+    // 对于支持 tool_calls 的模板，有的模板要求 tool_calls 的 messages.content 不能为空，
+    // 所以这里把空的 content 变为空字符串
     if (tmpl.original_caps().supports_tool_calls) {
         // some templates will require the content field in tool call messages
         // to still be non-null, this puts an empty string everywhere where the
@@ -2166,30 +2255,44 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         workaround::requires_non_null_content(params.messages);
     }
 
+    // 有些模板支持 object arguments，不需要把 arguments 强制作为字符串
     if (tmpl.original_caps().supports_object_arguments) {
         workaround::func_args_not_string(params.messages);
     }
-
+    
+    // 传入 chat template 和 jinja 渲染所需的输入，输出渲染后的 prompt 字符串（不含add_generation）
     params.add_generation_prompt = false;
     std::string no_gen_prompt    = common_chat_template_direct_apply_impl(tmpl, params);
+    
+    // 传入 chat template 和 jinja 渲染所需的输入，输出渲染后的 prompt 字符串（含add_generation）
     params.add_generation_prompt = true;
     std::string gen_prompt       = common_chat_template_direct_apply_impl(tmpl, params);
+    
+    // 比较加、不加 add_generation 的 prompt，推断出 add_generation 具体是加了什么字符串
     auto        diff             = calculate_diff_split(no_gen_prompt, gen_prompt);
+    // 保存 add_generation 对应的字符串
     params.generation_prompt     = diff.right + diff.suffix;
 
+    // 恢复输入本身的 add_generation_prompt 配置
     params.add_generation_prompt = inputs.add_generation_prompt;
 
+
+    // 注入一些通用模板的上下文变量
     params.extra_context = common_chat_extra_context();
+
+    // 如果输入的额外变量 inputs.chat_template_kwargs 存在，加入 params.extra_context
     for (auto el : inputs.chat_template_kwargs) {
         params.extra_context[el.first] = json::parse(el.second);
     }
 
+    // 如果 inputs.json_schema 非空，解析并注入 params.json_schema
     if (!inputs.json_schema.empty()) {
         params.json_schema = json::parse(inputs.json_schema);
     }
 
+    // 注入"是否允许工具并行调用"
     params.parallel_tool_calls = inputs.parallel_tool_calls;
-
+    // 检查 tools 冲突
     if (params.tools.is_array()) {
         if (params.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && !params.grammar.empty()) {
             throw std::runtime_error("Cannot specify grammar with tools");
@@ -2201,15 +2304,28 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         }
     }
 
+    // 如果 inputs.force_pure_content = true，不会渲染和解析 reasoning、tool_calls，默认全都是 string
+    // 直接返回 data
     if (inputs.force_pure_content) {
         LOG_WRN("Forcing pure content template, will not render reasoning or tools separately.");
         // Create the result structure
         common_chat_params data;
-        auto params_copy               = params;
+        auto params_copy               = params;    // 复制一份 params 副本
+        // 关闭 reasoning format
         params_copy.reasoning_format   = COMMON_REASONING_FORMAT_NONE;
+        // 用 jinja 模板生成 prompt
         data.prompt                    = common_chat_template_direct_apply_impl(tmpl, params_copy);
         data.format                    = COMMON_CHAT_FORMAT_PEG_NATIVE;
+        
+        // 获取 add_generation 对应的字符串
         data.generation_prompt         = params.generation_prompt;
+
+
+        // PEG parser 负责把模型生成的 string，解析成：
+        // 普通 answer content、thinking / reasoning content、tool calls
+
+        // 构建一个 PEG parser，先匹配 generation_prompt，后面所有的都是 content
+        // （因为inputs.force_pure_content = true，默认按 string 处理）
         auto parser                    = build_chat_peg_parser([&params](common_chat_peg_builder &p) {
             return p.prefix(params.generation_prompt) << p.content(p.rest());
         });
@@ -2217,25 +2333,48 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         return data;
     }
 
+
+    // 尝试匹配一些 llama.cpp 手写支持的特殊模板
     if (auto result = common_chat_try_specialized_template(tmpl, src, params)) {
         result->generation_prompt = params.generation_prompt;
         return *result;
     }
 
+
+    // 如果没有 pure content，也没有 specialized template，进入自动 parser 生成逻辑
+
     try {
         LOG_DBG("%s: using differential autoparser\n", __func__);
         struct autoparser::autoparser autoparser;
+        // 分析当前 jinja 模板
         autoparser.analyze_template(tmpl);
+
+        // 根据模板和参数初始化一个 common_chat_params 类型的 auto_params
+        // 内部会注入 auto_params.prompt
         auto auto_params = autoparser::peg_generator::generate_parser(tmpl, params, autoparser);
+        
+        // 判断当前模型是否支持 thinking/reasoning
         auto_params.supports_thinking = autoparser.reasoning.mode != autoparser::reasoning_mode::NONE;
+        // 保存识别到的 thinking 开始和结束符号，例如 <think>、</think>
         if (auto_params.supports_thinking) {
             auto_params.thinking_start_tag = autoparser.reasoning.start;
             auto_params.thinking_end_tag   = autoparser.reasoning.end;
         }
+
+        // 加入 add_generation 对应的字符串
         auto_params.generation_prompt = params.generation_prompt;
+
+
+        // PEG parser 负责把模型生成的 string，解析成：
+        // 普通 answer content、thinking / reasoning content、tool calls
+          
+        // 创建一个临时的 PEG arena，存储的是解析规则，用于解析模型输出，包含 thinking、reasoning 等
         common_peg_arena arena;
+        // 加载 auto_params.parser 字符串成 PEG 规则树，并打印
         arena.load(auto_params.parser);
         LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());
+        
+        // 返回 auto_params
         return auto_params;
     } catch (const std::exception & e) {
         throw std::invalid_argument(std::string("Unable to generate parser for this template. Automatic parser generation failed: ") + e.what());
@@ -2310,9 +2449,20 @@ static common_chat_params common_chat_templates_apply_legacy(const struct common
 
 common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                const struct common_chat_templates_inputs & inputs) {
-    
-    // 根据 inputs.use_jinja，决定生成 chat_template 的逻辑
-                                                GGML_ASSERT(tmpls != nullptr);
+    /*
+    common_chat_templates_inputs
+    -> 选择 Jinja chat template
+    -> 把 messages/tools/schema/thinking 等转换成模板参数
+    -> 渲染 prompt
+    -> 计算 generation_prompt
+    -> 根据模板和请求生成 parser/grammar
+    -> 返回 common_chat_params
+    */
+    // 根据 inputs.use_jinja，决定生成 chat_template 的方法
+    GGML_ASSERT(tmpls != nullptr);
+
+    // 返回 common_chat_params 类型，是一次 chat template 应用后的完整产物
+    // 既包含给模型看的 prompt，也包含后续生成约束、停止条件、thinking 信息和输出解析规则。
     return inputs.use_jinja ? common_chat_templates_apply_jinja(tmpls, inputs) :
                               common_chat_templates_apply_legacy(tmpls, inputs);
 }

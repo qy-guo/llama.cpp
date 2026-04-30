@@ -283,19 +283,21 @@ std::vector<server_tokens> tokenize_input_prompts(
 //
 
 // global server parameters for chat formatting / parsing
+// llama-server 处理消息时的全局参数
 struct server_chat_params {
-    bool use_jinja;
-    bool prefill_assistant;
-    common_reasoning_format reasoning_format;
+    bool use_jinja;             // 是否使用 jinja 渲染 prompt
+    bool prefill_assistant;     // 是否 prefill_assistant
+    common_reasoning_format reasoning_format;   // 使用的 reasoning 格式
+    // 传给 jinja 的额外参数
     std::map<std::string, std::string> chat_template_kwargs; // mapping key --> json value
-    common_chat_templates_ptr tmpls;
-    bool allow_image;
-    bool allow_audio;
-    bool enable_thinking = true;
-    int  reasoning_budget = -1;
-    std::string reasoning_budget_message;
-    std::string media_path;
-    bool force_pure_content = false;
+    common_chat_templates_ptr tmpls;    // 指向已经解析好的 chat templates，用于后续把 messages 渲染成 prompt
+    bool allow_image;                   // 是否允许 body 内的 msg.content 包含 image
+    bool allow_audio;                   // 是否允许 body 内的 msg.content 包含 audio
+    bool enable_thinking = true;        // 是否启用 thinking 模式
+    int  reasoning_budget = -1;         // reasoning/thinking 的 token 预算
+    std::string reasoning_budget_message;   // 和 reasoning budget 有关的提示文本
+    std::string media_path;             // 传入的 media 路径
+    bool force_pure_content = false;    // 是否以纯文本的形式传入 message
 };
 
 // used by /completions endpoint

@@ -49,17 +49,21 @@ struct common_chat_msg_content_part {
     }
 };
 
+// 使用 jinja 保存并解析一个 chat template 的相关内容
 struct common_chat_template {
-    jinja::program prog;
-    std::string bos_tok;
-    std::string eos_tok;
-    std::string src;
-    chat_template_caps caps;
+    jinja::program prog;        // 已经解析好的 jinja 模板程序
+    std::string bos_tok;        // BOS token
+    std::string eos_tok;        // EOS token
+    std::string src;            // chat template 的原始字符串
+    chat_template_caps caps;    // 记录 jinja 模板的能力
 
+
+    // 构造函数
+    // 使用 jinja，对传入的原始字符串模板 src 进行解析，得到可渲染的模板程序，并给成员变量赋值
     common_chat_template(const std::string & src, const std::string & bos_token, const std::string & eos_token) {
-        jinja::lexer lexer;
-        auto lexer_res = lexer.tokenize(src);
-        this->prog = jinja::parse_from_tokens(lexer_res);
+        jinja::lexer lexer;     // jinja 的内部词法分析器
+        auto lexer_res = lexer.tokenize(src);   // 将原始字符串模板 src 转换成 jinja 的 token 序列（不是LLM的token）
+        this->prog = jinja::parse_from_tokens(lexer_res);   // 渲染 jinja token，得到可执行的模板程序 prog
 
         this->src = lexer_res.source;
         this->bos_tok = bos_token;
@@ -156,37 +160,37 @@ enum common_chat_format {
 };
 
 struct common_chat_templates_inputs {
-    std::vector<common_chat_msg>          messages;
-    std::string                           grammar;
-    std::string                           json_schema;
-    bool                                  add_generation_prompt = true;
-    bool                                  use_jinja             = true;
+    std::vector<common_chat_msg>          messages;     // 对话消息数组，记录所有msg内的content
+    std::string                           grammar;      // 指定生成内容格式的 grammar
+    std::string                           json_schema;  // 指定生成内容格式的 json_schema
+    bool                                  add_generation_prompt = true; // 是否最佳 assistant 生成前缀
+    bool                                  use_jinja             = true; // 是否使用 jinja 类型 chat template
     // Parameters below only supported when use_jinja is true
-    std::vector<common_chat_tool>         tools;
-    common_chat_tool_choice               tool_choice         = COMMON_CHAT_TOOL_CHOICE_AUTO;
-    bool                                  parallel_tool_calls = false;
+    std::vector<common_chat_tool>         tools;        // OpenAI tools 解析后的工具列表
+    common_chat_tool_choice               tool_choice         = COMMON_CHAT_TOOL_CHOICE_AUTO;   // 工具调用策略
+    bool                                  parallel_tool_calls = false;  // 是否允许一次回复里产生多个 tool calls
     common_reasoning_format               reasoning_format    = COMMON_REASONING_FORMAT_NONE; // TODO: refactor this to "bool enable_thinking"
     bool                                  enable_thinking     = true;
-    std::chrono::system_clock::time_point now                 = std::chrono::system_clock::now();
-    std::map<std::string, std::string>    chat_template_kwargs;
+    std::chrono::system_clock::time_point now                 = std::chrono::system_clock::now();   // 当前时间
+    std::map<std::string, std::string>    chat_template_kwargs;         // 传给 jinja chat template 的额外参数
     bool                                  add_bos = false;
     bool                                  add_eos = false;
-    bool                                  force_pure_content = false;
+    bool                                  force_pure_content = false;   // 不解析 <think> 等结构，将所有内容作为输入
 };
 
 struct common_chat_params {
-    common_chat_format                  format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
-    std::string                         prompt;
-    std::string                         grammar;
-    bool                                grammar_lazy         = false;
-    std::string                         generation_prompt;
-    bool                                supports_thinking    = false;
+    common_chat_format                  format = COMMON_CHAT_FORMAT_CONTENT_ONLY;   // 模型输出的解析格式
+    std::string                         prompt;                         // 输入给模型的 prompt
+    std::string                         grammar;                        // 生成约束用的 grammar 字符串
+    bool                                grammar_lazy         = false;   // grammar 是否懒触发
+    std::string                         generation_prompt;              // assistant 开始生成的前缀，例如 ChatML 的"<|im_start|>assistant\n"
+    bool                                supports_thinking    = false;   // 当前模板 / 解析器是否识别 thinking/reasoning 结构
     std::string                         thinking_start_tag;  // e.g., "<think>"
     std::string                         thinking_end_tag;    // e.g., "</think>"
-    std::vector<common_grammar_trigger> grammar_triggers;
-    std::vector<std::string>            preserved_tokens;
-    std::vector<std::string>            additional_stops;
-    std::string                         parser;
+    std::vector<common_grammar_trigger> grammar_triggers;               // grammar 懒触发标记
+    std::vector<std::string>            preserved_tokens;               // 需要在后续处理中保留的特殊 token
+    std::vector<std::string>            additional_stops;               // chat template 额外要求的 stop 字符串
+    std::string                         parser;     // 序列化后的 PEG parser 字符串
 };
 
 // per-message parsing syntax
@@ -231,8 +235,7 @@ struct common_chat_params common_chat_templates_apply(const struct common_chat_t
 
 // Format single message, while taking into account the position of that message in chat history
 std::string common_chat_format_single(const struct common_chat_templates * tmpls,
-                                      const std::vector<common_chat_msg> & past_msg,
-                                      const common_chat_msg &              new_msg,
+                                      const std::vector<commchat_msg &              new_msg,
                                       bool                                 add_ass,
                                       bool                                 use_jinja);
 
@@ -242,7 +245,8 @@ std::string common_chat_format_example(const struct common_chat_templates *     
                                        const std::map<std::string, std::string> & chat_template_kwargs);
 
 const char *    common_chat_format_name(common_chat_format format);
-common_chat_msg common_chat_parse(const std::string & input, bool is_partial, const common_chat_parser_params & params);
+common_chat_msg common_chat_parse(const std::string on_chat_msg> & past_msg,
+                                      const common_& input, bool is_partial, const common_chat_parser_params & params);
 common_chat_msg common_chat_peg_parse(const common_peg_arena & src_parser, const std::string & input, bool is_partial, const common_chat_parser_params & params);
 
 // used by arg and server

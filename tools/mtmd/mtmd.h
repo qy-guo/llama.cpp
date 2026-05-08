@@ -282,7 +282,7 @@ struct mtmd_input_chunk_deleter {
 using input_chunk_ptr = std::unique_ptr<mtmd_input_chunk, mtmd_input_chunk_deleter>;
 
 struct bitmap {
-    bitmap_ptr ptr;
+    bitmap_ptr ptr;     // 指向 mtmd_bitmap 类型的 image、audio 数据
     bitmap() : ptr(nullptr) {}
     bitmap(mtmd_bitmap * bitmap) : ptr(bitmap) {}
     bitmap(bitmap && other) noexcept : ptr(std::move(other.ptr)) {}
@@ -306,6 +306,10 @@ struct bitmaps {
     //   auto bitmaps_c_ptr = bitmaps.c_ptr();
     //   int32_t res = mtmd_tokenize(... bitmaps_c_ptr.data(), bitmaps_c_ptr.size());
     std::vector<const mtmd_bitmap *> c_ptr() {
+        // 读取 entries 中每个 mtmd_bitmap 类型 bitmap 的内容
+
+        // 创建一个长为 entries.size() 的 res 数组
+        // 每个元素为 const 的 mtmd_bitmap *
         std::vector<const mtmd_bitmap *> res(entries.size());
         for (size_t i = 0; i < entries.size(); i++) {
             res[i] = entries[i].ptr.get();

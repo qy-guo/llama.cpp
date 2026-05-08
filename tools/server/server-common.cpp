@@ -345,7 +345,7 @@ const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
 }
 
 void server_tokens::push_back(llama_token tok) {
-    // 加入非 LLAMA_TOKEN_NULL 的 token
+    // 加入 text chunk 的 token
 
     if (tok == LLAMA_TOKEN_NULL) {
         throw std::runtime_error("Invalid token");
@@ -354,29 +354,48 @@ void server_tokens::push_back(llama_token tok) {
 }
 
 void server_tokens::push_back(const mtmd_input_chunk * chunk) {
+    // 获取 chunk 类型
     auto type = mtmd_input_chunk_get_type(chunk);
+
+    // 如果是 media chunk（image 或 audio）
     if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        // has_mtmd 必须为 true
         GGML_ASSERT(has_mtmd);
+        // 获取 chunk 对应的 token 数
         const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        
+        // 记录当前在插入 media chunk 之前的 tokens 长度，即插入的开始位置
         size_t start_idx = tokens.size();
+
+        // 在 tokens 数组尾部增加 n_tokens 个“LLAMA_TOKEN_NULL”占位符
         for (size_t i = 0; i < n_tokens; ++i) {
             tokens.emplace_back(LLAMA_TOKEN_NULL);
         }
         mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
+
+        // 建立“插入的开始位置 --> 当前 chunk”的映射
+        // 用于后续将 media chunk 的向量插入到 tokens 的正确位置
         map_idx_to_media[start_idx] = std::move(new_chunk);
-    } else if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+    } 
+    
+    // 如果是 text chunk，直接将 chunk 内的所有 token 依次加入 tokens
+    else if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         size_t n_tokens;
         const auto * text_tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
         for (size_t i = 0; i < n_tokens; ++i) {
             push_back(text_tokens[i]);
         }
-    } else {
+    } 
+    
+    // 如果是其他 chunk 类型，报错
+    else {
         GGML_ABORT("Invalid chunk type");
     }
 }
 
 void server_tokens::push_back(server_tokens & tokens) {
     // start_idx = this -> size()，即 this -> tokens.size()
+    // 获取当前的 tokens 长度，作为插入 text chunk 的 token 的起始位置
     size_t start_idx = size();
 
     // 逐个加入非 LLAMA_TOKEN_NULL 的 token
@@ -728,38 +747,56 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
     for (auto & file : files) {
 
         // 将 image 或 audio 解码并保存成 mtmd_bitmap 类型
-        // 调用 bitmap 的 bitmap(mtmd_bitmap * bitmap) 构造函数，默认 bmp.ptr 指向解码后的 mtmd_bitmap 类型
+        // 调用 bitmap 的 bitmap(mtmd_bitmap * bitmap) 构造函数，
+        // bmp.ptr 指向解码后的 mtmd_bitmap 类型
         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
+        
+        // bmp.ptr 指向空，解析失败
         if (!bmp.ptr) {
             throw std::runtime_error("Failed to load image or audio file");
         }
         // calculate bitmap hash (for KV caching)
+        // 计算 file 解码后的 hash，用于后续的 kvcache（判断是否是同一个 media）
         std::string hash = fnv_hash(bmp.data(), bmp.n_bytes());
-        bmp.set_id(hash.c_str());
+
+        // 保存 bitmap 的哈希映射 bitmap.id = hash
+        bmp.set_id(hash.c_str());   // string 的 c_str() 会返回字符数组的指针
+        
+        // 将 bitmap 存入 bitmaps.entries
         bitmaps.entries.push_back(std::move(bmp));
     }
     // process prompt
     std::vector<server_tokens> inputs;
     // multimodal
+    // 构造 mtmd_input_text 类型的 inp_text，inp_text.text 指向 prompt 的第一个字符
     mtmd_input_text inp_txt = {
         prompt.c_str(),
         /* add_special */   true,
         /* parse_special */ true,
     };
+
+    // 创建一个 mtmd_input_chunks 类型的对象，用于存储 mtmd_input_chunk 类型的数组
+    // 并让 chunks.ptr 指向该对象
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
+
+    // bitmaps_c_ptr 是一个 std::vector<const mtmd_bitmap *> 的数组对象
+    // 每个元素是一个指向 mtmd_bitmap 类型的 bitmap 的指针
     auto bitmaps_c_ptr = bitmaps.c_ptr();
 
     // 调用 tokenize，结果保存到 chunks 中，并返回运行状态结果 tokenized
-    int32_t tokenized = mtmd_tokenize(mctx,
-                                      chunks.ptr.get(),
-                                      &inp_txt,
-                                      bitmaps_c_ptr.data(),
-                                      bitmaps_c_ptr.size());
+    int32_t tokenized = mtmd_tokenize(mctx,                 // 多模态上下文
+                                      chunks.ptr.get(),     // 存储 chunk 的数组
+                                      &inp_txt,             // mtmd_input_text 类型的 prompt
+                                      bitmaps_c_ptr.data(), // 指向数组的首元素地址
+                                      bitmaps_c_ptr.size());// 数组长度
     if (tokenized != 0) {
         throw std::runtime_error("Failed to tokenize prompt");
     }
 
-    // chunks 包装成 server_tokens 类型
+    // chunks 包装成 server_tokens 类型，根据 chunk 类型进行 2 种处理：
+    // 对于 text chunk：直接将 chunk 内的 token id 加入 result.tokens
+    // 对于 media chunk：将 chunk 内的 token 用占位符代替，
+    //                  并将 media 写入 result.map_idx_to_media，后续再替换
     auto result = server_tokens(chunks, true);
     return result;
 }

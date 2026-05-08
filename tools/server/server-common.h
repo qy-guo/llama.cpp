@@ -132,6 +132,8 @@ private: // disallow accessing these members directly, risking out-of-sync
 
     // map a **start** index in tokens to the image chunk
     // note: the order need to be in-sync with tokens
+    
+    // 保存 media chunk 的内容
     std::map<size_t, mtmd::input_chunk_ptr> map_idx_to_media;
 
     // list of tokens
@@ -139,6 +141,10 @@ private: // disallow accessing these members directly, risking out-of-sync
     //   otherwise, it is a normal text token
     // note: a non-text chunk can occupy multiple tokens (aka memory cells) in the token list
     // note(2): for M-RoPE, an image can occupy different number of pos; do not assume 1-to-1 mapping tokens <-> pos
+    
+    // 保存 tokens，分为 2 种情况：
+    // text chunk：依次保存 token id
+    // media chunk：对应 token 长度的占位符
     llama_tokens tokens;
 
     // for ex. with input of 5 text tokens and 2 images (each image occupies 3 tokens and 2 pos):

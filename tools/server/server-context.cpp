@@ -3140,6 +3140,7 @@ struct server_res_generator : server_http_res {
     server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
             : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
         // fast path in case sleeping is disabled
+        // a |= b <=> a = a | b
         bypass_sleep |= sleep_idle_seconds < 0;
         if (!bypass_sleep) {
             queue_tasks.wait_until_no_sleep();
@@ -3170,46 +3171,86 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const json & data,
             const std::vector<raw_buffer> & files,
             task_response_type res_type) {
-    GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
+    
+    /*不是直接做推理的函数，更像 HTTP route 层的“任务构造器”：
+        读取请求参数，把 prompt/files 转成 server_tokens，
+        再包装成 server_task，投递到 server queue，
+        最后根据 stream 决定怎么等结果。*/
 
+    // 状态检查：只允许 SERVER_TASK_TYPE_COMPLETION 或 SERVER_TASK_TYPE_INFILL
+    GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
+    
+    // 创建响应对象和 completion id
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
+
+    // rd 是后续投递任务、读取结果的入口
     auto & rd = res->rd;
 
+    // 处理 prompt
     try {
+        // 存储 server task
         std::vector<server_task> tasks;
 
+        // 获取处理好的 prompt
         const auto & prompt = data.at("prompt");
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
         //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
 
         // process prompt
+        // server tokens 数组，每个 server tokens 记录 token 等信息
         std::vector<server_tokens> inputs;
         
 
-        // 如果是 OAI chat 路径且多模态上下文不为空，则调用 process_mtmd_prompt
+        // 如果是 res_type != TASK_RESPONSE_TYPE_NONE 且多模态上下文不为空，则调用 process_mtmd_prompt
+        // 此分支下，inputs 数组默认只有 1 个 server tokens 类型的元素
+        // Qwen3.5-0.8B 默认走此分支（启动命令的 mmproj 参数不为空）
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
-        } else {
+        } 
+        
+        // 否则，调用 tokenize_input_prompts() 函数
+        // 该分支下，inputs 数组可能有多个 server tokens 类型的元素
+        else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
-        for (size_t i = 0; i < inputs.size(); i++) {
-            server_task task = server_task(type);
 
+        // 构造 server task
+
+        // 遍历每个 server_tokens 类型，每个 server tokens 会生成一个 server task
+        // Qwen3.5-0.8B 分支默认 inputs 只包含 1 个元素
+        for (size_t i = 0; i < inputs.size(); i++) {
+
+            // 获取当前 server task type
+            server_task task = server_task(type);
+            
+            // 为当前 task 在 server_queue 中分配 task id
             task.id = rd.get_new_id();
 
+            // 把 server token 的内容转移给 task.tokens
             task.tokens = std::move(inputs[i]);
+            
+
+            // task.params 记录 task 运行时的参数
+
+            /*把 server 默认配置 params
+            + 当前请求 JSON data
+            + 当前词表 vocab
+            + 当前 slot 上下文长度 slot_n_ctx
+            + EOG logit bias 配置
+            合并解析成一次 server_task 使用的 task_params*/
             task.params = server_task::params_from_json_cmpl(
-                    ctx_server.vocab,
-                    params,
-                    meta->slot_n_ctx,
-                    meta->logit_bias_eog,
-                    data);
+                    ctx_server.vocab,       // 词表
+                    params,                 // server_routes 持有的全局 common_params，即 server 启动时的参数
+                    meta->slot_n_ctx,       // 单个 slot 的上下文长度，用于设置采样时 penalty 的上下文查长度
+                    meta->logit_bias_eog,   // EOG logit bias 配置
+                    data                    // 读取本次请求的参数，会覆盖全局的 params
+                );
             task.id_slot = json_value(data, "id_slot", -1);
 
             // OAI-compat
@@ -3218,6 +3259,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.oaicompat_model   = meta->model_name;
 
             // prepare child tasks
+            // 如果同一个 prompt 需要生成的结果数量 n > 1
+            // 则除了当前的 task 外，还需要再加入 n - 1 个 task
             if (task.params.n_cmpl > 1) {
                 int n_children = task.params.n_cmpl - 1;
                 for (int j = 0; j < n_children; j++) {
@@ -3767,15 +3810,17 @@ void server_routes::init_routes() {
         // 解析请求体 JSON
         json body = json::parse(req.body);
         json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+            body,               // 请求体 json
+            meta->chat_params,  // llama-server 处理消息时的全局参数
+            files               // 存储 image、audio
+        );
         return handle_completions_impl(
-            req,
-            SERVER_TASK_TYPE_COMPLETION,
-            body_parsed,
-            files,
-            TASK_RESPONSE_TYPE_OAI_CHAT);
+            req,                            // chat 的 http 请求
+            SERVER_TASK_TYPE_COMPLETION,    // server task type，用于断言检测
+            body_parsed,                    // 解析后的请求体 json
+            files,                          // 存储 image、audio
+            TASK_RESPONSE_TYPE_OAI_CHAT     // 返回格式，例如 OpenAI completion、OpenAI chat、Anthropic
+        );
     };
 
     this->post_responses_oai = [this](const server_http_req & req) {

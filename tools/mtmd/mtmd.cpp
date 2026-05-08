@@ -29,6 +29,7 @@ struct mtmd_bitmap {
     uint32_t nx;
     uint32_t ny;
     std::vector<unsigned char> data;
+    // 用于存储 image、audio 的 hash，便于 kvcache
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
 };

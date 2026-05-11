@@ -2117,6 +2117,15 @@ private:
         }
     }
 
+    /*update_slots()
+    -> 发现还有 slot 在生成
+    -> 往 queue_tasks 里塞一个 NEXT_RESPONSE
+    -> 主循环下一轮取到 NEXT_RESPONSE
+    -> process_single_task 对它什么也不做
+    -> 队列又空了
+    -> callback_update_slots()
+    -> 再次 update_slots()
+    */
     void update_slots() {
         // check if all slots are idle
         {
@@ -2599,6 +2608,12 @@ private:
                     bool has_mtmd = false;
 
                     // check if we should process the image
+
+                    // 多模态 encode 在此执行
+                    // 当遇到 LLAMA_TOKEN_NULL 占位符时，对对应的 image chunk 做多模态的 encode
+                    // 然后把得到的 image embedding 加入 llama context
+
+                    // 检查当前 prompt 处理进度处，下一个未处理内容是不是 media chunk 占位符
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
@@ -2613,6 +2628,7 @@ private:
                         slot.n_prompt_tokens_processed += n_tokens_out;
 
                         // add the image chunk to cache
+                        // 把 image chunk 加入 slot 的 prompt cache
                         {
                             const auto & chunk = input_tokens.find_chunk(slot.prompt.n_tokens());
                             slot.prompt.tokens.push_back(chunk.get()); // copy
@@ -2622,9 +2638,12 @@ private:
                     }
 
                     // add prompt tokens for processing in the current batch
+                    // 如果 prompt 还有没处理的 token，并且 batch 还能放，就继续塞文本 token
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
+
+                        // 如果遇到 media 占位符，则 break
                         if (cur_tok == LLAMA_TOKEN_NULL) {
                             break; // end of text chunk
                         }
@@ -2638,6 +2657,7 @@ private:
                         }
 
                         // embedding requires all tokens in the batch to be output
+                        // 把文本 token 放进 batch
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
@@ -2673,7 +2693,14 @@ private:
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
 
                     // entire prompt has been processed
+                    /*当整个 prompt 都已经处理完
+                        -> slot 状态变成 DONE_PROMPT
+                        -> 只要求最后一个 prompt token 输出 logits
+                        -> 记录最后一个 token 在 batch 里的位置
+                        -> 初始化 sampler
+                    */ 
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                        // 更新 state，完成 prompt 处理
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
                         GGML_ASSERT(batch.n_tokens > 0);
@@ -2686,7 +2713,10 @@ private:
 
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
-                    } else {
+                    } 
+                    
+                    // 如果整个 prompt 没处理完，例如处理 text token 突然遇到了 media token 占位符然后 break 了
+                    else {
                         if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
                             // near the end of the prompt
                             do_checkpoint = do_checkpoint && true;
@@ -2770,6 +2800,7 @@ private:
         int32_t i_next = 0;
 
         // process the created batch of tokens
+        // 处理创建的 token batch
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
 
@@ -2783,6 +2814,7 @@ private:
                 batch.logits   + i,
             };
 
+            // 进入真正的 decode
             const int ret = llama_decode(ctx, batch_view);
 
             metrics.on_decoded(slots);
@@ -2911,6 +2943,7 @@ private:
 
                 const int tok_idx = slot.i_batch - i;
 
+                // 采样下一个 token
                 llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
 
                 slot.i_batch = -1;
@@ -2932,6 +2965,8 @@ private:
 
                 completion_token_output result;
                 result.tok          = id;
+
+                // 转换成文本
                 result.text_to_send = common_token_to_piece(slot.ctx, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
@@ -3180,7 +3215,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     // 状态检查：只允许 SERVER_TASK_TYPE_COMPLETION 或 SERVER_TASK_TYPE_INFILL
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
     
-    // 创建响应对象和 completion id
+    // 创建响应对象 res 和 completion id
+
+    // res 是 server_res_generator 类型，用于获得类似于 HTTP response 的结果
+    // 需要将 res->rd 补齐 
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
 
@@ -3239,15 +3277,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // task.params 记录 task 运行时的参数
 
             /*把 server 默认配置 params
-            + 当前请求 JSON data
-            + 当前词表 vocab
-            + 当前 slot 上下文长度 slot_n_ctx
-            + EOG logit bias 配置
+                + 当前请求 JSON data
+                + 当前词表 vocab
+                + 当前 slot 上下文长度 slot_n_ctx
+                + EOG logit bias 配置
             合并解析成一次 server_task 使用的 task_params*/
             task.params = server_task::params_from_json_cmpl(
                     ctx_server.vocab,       // 词表
                     params,                 // server_routes 持有的全局 common_params，即 server 启动时的参数
-                    meta->slot_n_ctx,       // 单个 slot 的上下文长度，用于设置采样时 penalty 的上下文查长度
+                    meta->slot_n_ctx,       // 单个 slot 的上下文长度，用于设置采样时 penalty 的上下文长度
                     meta->logit_bias_eog,   // EOG logit bias 配置
                     data                    // 读取本次请求的参数，会覆盖全局的 params
                 );
@@ -3267,63 +3305,104 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     task.add_child(task.id, rd.get_new_id());
                 }
             }
-
+            
+            // 把当前 task 加入 tasks
             tasks.push_back(std::move(task));
         }
 
+        // 把 tasks 这批任务移交给 server_response_reader 类型的 rd
+        // 内部会为 tasks 内的任务进行处理并将：
+        //      所有 task id 加入 queue_results 队列
+        //      所有 task 加入 queue_tasks 队列
         rd.post_tasks(std::move(tasks));
-    } catch (const std::exception & e) {
+    } 
+    
+    catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
 
+    // 获取 data 中的 stream 字段
     bool stream = json_value(data, "stream", false);
 
+    // 如果是非流式输出
     if (!stream) {
         // non-stream, wait for the results
+        // 从 rd.queue_results 中收集所有 result 到 all_results 中，
+        // 直到所有任务都 stop 或出现 error
         auto all_results = rd.wait_for_all(req.should_stop);
+
+        // 如果连接超时，直接返回 res
         if (all_results.is_terminated) {
             return res; // connection is closed
-        } else if (all_results.error) {
+        } 
+        
+        // 如果某个任务返回 error，把错误信息 json 写入 res
+        else if (all_results.error) {
             res->error(all_results.error->to_json());
             return res;
-        } else {
+        } 
+        
+        // 如果所有结果正常
+        else {
             json arr = json::array();
+
+            // 遍历每个 task 的 result，将结果 json 加入 arr
             for (auto & res : all_results.results) {
                 GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
                 arr.push_back(res->to_json());
             }
             GGML_ASSERT(!arr.empty() && "empty results");
+            
+            // 如果只有一条 result，直接返回 arr[0]
             if (arr.size() == 1) {
                 // if single request, return single object instead of array
                 res->ok(arr[0]);
-            } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
+            } 
+            
+            // 如果是 OpenAI 兼容格式且有多条 result
+            // 把多个 response 的 choices[0] 合并到第一个 response 的 choices 数组里
+            // 这样对外看起来仍然是一个 OpenAI 风格响应，只是有多个 choice
+            else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
                 // if multiple results in OAI format, we need to re-format them
                 json & choices = arr[0]["choices"];
                 for (size_t i = 1; i < arr.size(); i++) {
                     choices.push_back(std::move(arr[i]["choices"][0]));
                 }
                 res->ok(arr[0]);
-            } else {
+            } 
+            
+            // 如果是非 OpenAI 格式且有多条 result，直接返回 arr 数组
+            else {
                 // multi-results, non-OAI compat
                 res->ok(arr);
             }
         }
-    } else {
+    } 
+    
+    // 如果是流式输出
+    else {
         // in streaming mode, the first error must be treated as non-stream response
         // this is to match the OAI API behavior
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
+        
+        // 拿取第一个 rd.queue_results 输出，进行检查
         auto first_result = rd.next(req.should_stop);
+
+        // 如果第一个输出是 nullptr，说明连接超时
         if (first_result == nullptr) {
             GGML_ASSERT(req.should_stop());
             return res; // connection is closed
         }
 
+        // 如果第一个输出是 error，被当成非流式的响应返回
         if (first_result->is_error()) {
             res->error(first_result->to_json());
             return res;
         }
 
+        // 第一个输出必须是 completion partial 或 final
+        // partial 是流式中间片段，final 是最终片段
         GGML_ASSERT(
             dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
             dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
@@ -3331,6 +3410,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // next responses are streamed
         // to be sent immediately
+        // 把第一个输出结果转换成不同接口格式的 SSE，并暂存入 res->data
         json first_result_json = first_result->to_json();
         if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
             res->data = format_anthropic_sse(first_result_json);
@@ -3339,8 +3419,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         } else {
             res->data = format_oai_sse(first_result_json);
         }
-        res->status = 200;
-        res->content_type = "text/event-stream";
+        res->status = 200;      // http 状态
+        res->content_type = "text/event-stream";    // http response content_type
+        
+        // 不断发送拉取 SSE chunk
+        // 未精读
         res->next = [res_this = res.get(), res_type, &req](std::string & output) -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
@@ -3807,13 +3890,27 @@ void server_routes::init_routes() {
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
-        // 解析请求体 JSON
+        // 请求体 jon
         json body = json::parse(req.body);
+
+        /* handle_completions_impl() 函数负责：
+                1）处理 msg.content 的 "image_url" 和 "input_audio" 的多模态消息格式
+                2）获取 image、audio 信息并存入 files
+                2）渲染 prompt、获取模型输出的解析规则
+                3）解析并提取请求体 json 中的其他参数
+        */
         json body_parsed = oaicompat_chat_params_parse(
             body,               // 请求体 json
             meta->chat_params,  // llama-server 处理消息时的全局参数
             files               // 存储 image、audio
         );
+
+        /* handle_completions_impl() 函数负责：
+                1）内部处理 prompt 成 server tokens
+                2）构建 server task，包含 server tokens、task 的参数等信息
+                3）将 server task 加入任务队列等待执行
+                4）读取执行结果队列内的结果，将结果通过流式或非流式输出
+        */
         return handle_completions_impl(
             req,                            // chat 的 http 请求
             SERVER_TASK_TYPE_COMPLETION,    // server task type，用于断言检测

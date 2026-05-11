@@ -20,20 +20,30 @@
 //
 
 int server_queue::post(server_task && task, bool front) {
+    // 加锁保护任务队列，避免 http 线程提交任务 与 server 主循环获取任务时发生冲突
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
+    
     // if this is cancel task make sure to clean up pending tasks
+    // 如果是取消任务，根据 id 清理待处理的任务
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
     }
+
+    // 将任务加入当前任务序列
     const int task_id = task.id;
     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
+    // 头插
     if (front) {
         queue_tasks.push_front(std::move(task));
-    } else {
+    } 
+    // 尾插
+    else {
         queue_tasks.push_back(std::move(task));
     }
+    // 更新收到新任务的时间戳
     time_last_task = ggml_time_ms();
+    // 唤醒等待任务的 server 主循环，从任务队列头部取任务并执行
     condition_tasks.notify_one();
     return task_id;
 }
@@ -136,9 +146,11 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         return (now - time_last_task) >= idle_sleep_ms;
     };
 
+    // 第一层 while，server 主循环一直存活
     while (true) {
         QUE_DBG("%s", "processing new tasks\n");
 
+        // 第二层 while，不断从 queue_tasks 中取任务
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running) {
@@ -149,6 +161,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 lock.unlock();
                 break;
             }
+            // 取任务
             server_task task = std::move(queue_tasks.front());
             queue_tasks.pop_front();
             lock.unlock();
@@ -168,7 +181,12 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         }
 
         QUE_DBG("%s", "waiting for new tasks\n");
+
+        
         while (true) {
+            // 创建锁管理器类型的 lock 对象，自动给 mutex_tasks 加锁和解锁
+            // lock 会锁住每一轮 while 循环内的变量的访问，例如 running、queue_tasks
+            // 直到 wait_for 时会释放锁，允许写入这些变量
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running || !queue_tasks.empty()) {
                 break; // go back to process new tasks or terminate
@@ -192,10 +210,24 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 callback_sleeping_state(false);
                 sleeping = false;
                 time_last_task = ggml_time_ms();
+                // 通知其他线程，已经释放锁
                 condition_tasks.notify_all(); // notify wait_until_no_sleep()
                 break; // process new tasks
             } else {
                 // wait for new tasks or timeout for checking sleeping condition
+                
+                // 具体流程为：
+                // 消费者：队列为空时，进入 wait for，释放所并等待（最多等 max_wait_time）
+                // 生产者：有新任务，拿到锁，将 tasks 加入任务队列，释放锁
+                // 生产者：notify_one 唤醒消费者
+                // 消费者：重新拿锁，检查 (!queue_tasks.empty() || !running)
+                // 消费者：条件成立，wait for 返回 true，否则返回 false
+                // 等待新的 tasks 内的 task 被写入、调用 condition_tasks.notify_one()
+
+                // wait_for 参数：
+                // lock：互斥锁，wait for 等待时会临时释放锁，唤醒后重新加锁
+                // max_wait_time：最长等待时间
+                // lambda 表达式：[&] 表示能访问 lambda 表达式外部的变量（queue_tasks、running）
                 bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
                     return (!queue_tasks.empty() || !running);
                 });
@@ -352,20 +384,30 @@ void server_response_reader::post_task(server_task && task, bool front) {
 
 void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool front) {
     GGML_ASSERT(id_tasks.empty() && "post_tasks() can only be called once per reader");
+    
+    // 获取 tasks 内所有 task 的 id，用于后续接收结果
     id_tasks = server_task::get_list_id(tasks);
+
+    // 提前给状态数组预留空间
     states.reserve(tasks.size());
     size_t index = 0;
+    // 每个 task 一个 index，并创建对应的结果状态
     for (auto & task : tasks) {
         task.index = index++;
         states.push_back(task.create_state());
         // for child tasks
+        // 如果一个请求要生成多个回答，则需要 child task，这里也给 child task 记录 index
         for (auto & child_task : task.child_tasks) {
             child_task.index = index++;
             states.push_back(child_task.create_state());
         }
     }
     GGML_ASSERT(states.size() == id_tasks.size());
+    
+    // 把 tasks 内的所有 task id 加入 server_response_reader 的结果队列
     queue_results.add_waiting_task_ids(id_tasks);
+    
+    // 把 tasks 内的任务加入 server_response_reader 的任务队列队尾（默认 front=false）
     queue_tasks.post(std::move(tasks), front);
 }
 
@@ -412,10 +454,14 @@ server_response_reader::batch_response server_response_reader::wait_for_all(cons
     batch_res.results.resize(id_tasks.size());
     while (has_next()) {
         auto res = next(should_stop);
+
+        // 连接超时
         if (res == nullptr) {
             batch_res.is_terminated = true;
             return batch_res;
         }
+
+        // 发生错误
         if (res->is_error()) {
             batch_res.error = std::move(res);
             return batch_res;

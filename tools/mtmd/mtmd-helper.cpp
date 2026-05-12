@@ -269,14 +269,14 @@ int32_t mtmd_helper_decode_image_chunk(
     if (mtmd_decode_use_mrope(ctx)) {
         // 对于 image chunk
         if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-            // 获取 token
+            // 获取 image chunk 的 bitmap
             const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
             if (!image_tokens) {
                 LOG_ERR("failed to decode chunk: image tokens are null\n");
                 return -1;
             }
 
-            // 重新获取一次 chunk token 数
+            // 重新获取一次 iamge chunk 对应的 token 数
             const auto n_tokens = mtmd_image_tokens_get_n_tokens(image_tokens);
 
             // 定义一个长为 n_tokens 的数组，数组元素是 mtmd_decoder_pos 类型
@@ -315,6 +315,8 @@ int32_t mtmd_helper_decode_image_chunk(
         LOG_INF("decoding %s batch %d/%d, n_tokens_batch = %d\n", name, i_batch+1, n_img_batches, n_tokens_batch);
 
         int64_t t1 = ggml_time_ms();
+
+        // 在主模型中进行 decode
         int32_t ret = llama_decode(lctx, batch_embd_view);
         if (ret != 0) {
             LOG_ERR("failed to decode %s\n", name);
@@ -382,7 +384,7 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
                 text_batch.logits[text_batch.n_tokens - 1] = true;
             }
 
-
+            
             ret = llama_decode(lctx, text_batch);
             if (ret != 0) {
                 LOG_ERR("failed to decode text\n");
@@ -405,6 +407,8 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
 
         // 传入 chunk，路由 image chunk 和 audio chunk 到不同的处理逻辑
         ret = mtmd_encode_chunk(ctx, chunk);
+        
+        // 如果处理失败，清空 text_batch，返回错误代码
         if (ret != 0) {
             LOG_ERR("failed to encode %s slice\n", name);
             llama_batch_free(text_batch);
@@ -413,8 +417,10 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
 
         LOG_INF("%s slice encoded in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
 
-        // 获取 chunk 内所有 token 的 embedding
+        // 获取 chunk 内所有 media token 计算后的 embedding
         float * embd = mtmd_get_output_embd(ctx);
+
+        // 把 media embedding 输入到 llama 进行 decode
         ret = mtmd_helper_decode_image_chunk(ctx, lctx, chunk, embd, n_past, seq_id, n_batch, new_n_past);
         if (ret != 0) {
             LOG_ERR("failed to decode %s\n", name);

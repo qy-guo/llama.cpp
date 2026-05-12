@@ -78,6 +78,7 @@ int main(int argc, char ** argv) {
 
     common_init();
 
+    // 解析参数
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
     }
@@ -168,6 +169,8 @@ int main(int argc, char ** argv) {
         ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
     }
 
+
+    // 注册路由
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
@@ -261,6 +264,7 @@ int main(int argc, char ** argv) {
         };
 
         // start the HTTP server before loading the model to be able to serve /health requests
+        // 启动 http 服务
         if (!ctx_http.start()) {
             clean_up();
             LOG_ERR("%s: exiting due to HTTP server error\n", __func__);
@@ -276,6 +280,8 @@ int main(int argc, char ** argv) {
             });
         }
 
+        // 加载模型
+        // 如果提供了 mmproj 参数，则加载 mmproj
         if (!ctx_server.load_model(params)) {
             clean_up();
             if (ctx_http.thread.joinable()) {
@@ -332,6 +338,7 @@ int main(int argc, char ** argv) {
         }
 
         // this call blocks the main thread until queue_tasks.terminate() is called
+        // 开启主循环
         ctx_server.start_loop();
 
         clean_up();

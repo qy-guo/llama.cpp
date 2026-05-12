@@ -1136,7 +1136,7 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
     // 读取 projector 类型
     auto proj_type = clip_get_projector_type(ctx_clip);
 
-    // 读取 projector 的输入维度
+    // 读取 projector 的输出维度
     // 在 Qwen3.5-0.8B 中，n_mmproj_embd = 1024
     // projector 是 Linear(3072, 3072) + GELU + Linear(3072, 1024)
     int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
@@ -1171,7 +1171,7 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
             &image_tokens->batch_f32,   // image_tokens 对应的 bitmap 派生出的所有图像（Qwen3VL只有1张）
             ctx->image_embd_v.data());  // image embedding vector
     }
-
+    // 正常调用返回 0
     return ok ? 0 : 1;
 }
 
@@ -1427,7 +1427,9 @@ const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
 
 llama_pos mtmd_image_tokens_get_n_pos(const mtmd_image_tokens * image_tokens) {
     switch (image_tokens->pos) {
+        // M-RoPE
         case MTMD_POS_TYPE_MROPE:
+            // 返回 max(nx, ny)
             return std::max(image_tokens->nx, image_tokens->ny);
         case MTMD_POS_TYPE_NORMAL:
             return image_tokens->n_tokens();

@@ -244,28 +244,53 @@ server_tokens::server_tokens(const llama_tokens & tokens, bool has_mtmd) : has_m
 }
 
 llama_pos server_tokens::pos_next(int64_t n_tokens) const {
+    /*返回当前这串 server_tokens 处理完后，下一个 token / media 的 llama_pos 应该是多少
+    n_tokens默认为-1，表示整段 prompt 处理完后的下一个 pos*/
+    
+    // 如果 has_mtmd=false
     if (!has_mtmd) {
+        // 如果 n_tokens=-1，返回 tokens 的长度
         if (n_tokens < 0) {
             return tokens.size();
         }
-
+        // 否则，返回 n_tokens
+        // 例如当前 n_tokens = 5 ---> pos: 0, 1, 2, 3, 4
+        //    那下一个 token 的 pos = n_tokens = 5
         return n_tokens;
     }
 
+    // 如果 has_mtmd=true，说明 server_tokens 内有占位符 LLAMA_TOKEN_NULL
+    // 即 token.size() = 普通 token 数 + media chunk 对应 token 个数的占位符
+
+    // 如果 n_tokens=-1，
     if (n_tokens < 0) {
+        // 先假设每个 token / 占位符都占 1 个 pos
         llama_pos res = tokens.size();
 
+        // 遍历所有 map_idx_to_media，获取 media chunk，对每个 media chunk 做修正
         for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
+            // 获取所有 media chunk
             const auto & chunk = it->second;
+            
+            // 真实的下一个 token 的 pos =
+            //      tokens.size() - 所有 media chunk 的 n_tokens + 所有 media chunk 的 n_pos
+            // 以Qwen3.5-0.8B（M-RoPE）为例：
+            //      假设当前有 5 个 text token，1 个 image，
+            //      image 的 nx = 2、ny = 3，占 nx * ny = 6 个 token
+            //      那么，tokens_size() = 5 + 6 = 11
+            //           修正量 = max(nx, ny) - nx * ny = 3 - 6 = -3
+            //           pos_next = tokens_size() + 修正量 = 11 + (-3) = 8
+            //      故，下一个 token / media 的位置是 8（已有的占了 8 个位置，但位置是从 0 开始）
             res += mtmd_input_chunk_get_n_pos(chunk.get()) - mtmd_input_chunk_get_n_tokens(chunk.get());
         }
 
         return res;
     }
 
+
     int64_t idx = 0;
     llama_pos pos = 0;
-
+    // n_tokens
     GGML_ASSERT(n_tokens <= (int64_t)tokens.size());
 
     while (idx < n_tokens) {
@@ -564,13 +589,18 @@ int32_t server_tokens::process_chunk(
             llama_pos pos,
             int32_t seq_id,
             size_t & n_tokens_out) const {
+    // 根据 id 找到对应的 media chunk
     const auto & chunk = find_chunk(idx);
+    // 获取 media chunk 的 type（image 或 audio）
     const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
                         ? "image" : "audio";
     SRV_INF("processing %s...\n", name);
     int32_t n_batch = llama_n_batch(ctx);
     int64_t t0 = ggml_time_ms();
     llama_pos new_n_past; // unused for now
+
+    // 对 media chunk 走相应的计算图
+    // Qwen3.5-0.8B 进入 mmproj 对应的 vision encoder
     int32_t result = mtmd_helper_eval_chunk_single(mctx, ctx,
         chunk.get(),
         pos,
@@ -584,6 +614,7 @@ int32_t server_tokens::process_chunk(
         n_tokens_out = 0;
         return result;
     }
+    // 获取该 media chunk 对应的 token 数
     n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
     return 0;
 }

@@ -2250,6 +2250,7 @@ private:
 
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.n_tokens == 0) {
+            // 遍历所有正在处理的 slot
             for (auto & slot : slots) {
                 if (!slot.is_processing()) {
                     continue;
@@ -2267,17 +2268,23 @@ private:
                 }
 
                 // this slot still has a prompt to be processed
+                // 只处理这 2 种状态的 slot：
+                //  1）slot 刚开始处理
+                //  2）slot 正在处理
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    // 读取目标输入
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.n_tokens;
 
                     // TODO: maybe move branch to outside of this loop in the future
+                    // 如果是 1）slot 刚开始处理
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
 
+                        // slot 状态更新为“正在处理”
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
@@ -2350,6 +2357,7 @@ private:
                                 continue;
                             }
 
+                            // 如果允许 prompt cache，会计算新 prompt 和旧 prompt 的公共前缀、复用 cache
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
@@ -2544,7 +2552,8 @@ private:
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
-
+                        
+                        // slot.prompt.tokens 只保留已复用的前 n_past 个 token/chunk
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
@@ -2592,9 +2601,18 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                    // do_checkpoint 表示：
+                    //      当前这一轮 prompt processing 中，是否要在调用 llama_decode() 之前，
+                    //      为当前 slot 保存一份 context / KV 状态 checkpoint
+                    // do_checkpoint 包括：
+                    //      pos_min
+                    //      pos_max
+                    //      n_tokens
+                    //      data
+                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;     // 读取参数
 
                     // make checkpoints only for completion tasks
+                    // do_checkpoint 只在 completion 任务中考虑
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
 
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
@@ -2605,7 +2623,7 @@ private:
                             (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ||
                             (llama_model_n_swa(model) > 0 && !params_base.swa_full));
 
-                    bool has_mtmd = false;
+                    bool has_mtmd = false;  // 当前已消费的进度中是否包含 media
 
                     // check if we should process the image
 
@@ -2613,10 +2631,18 @@ private:
                     // 当遇到 LLAMA_TOKEN_NULL 占位符时，对对应的 image chunk 做多模态的 encode
                     // 然后把得到的 image embedding 加入 llama context
 
-                    // 检查当前 prompt 处理进度处，下一个未处理内容是不是 media chunk 占位符
+                    // slot.prompt：表示已喂给模型的输入进度，包含当前 slot 已在模型/KV cache 中拥有的 prompt 状态
+                    // slot.task：  表示目标输入，包含当前请求的参数、采样配置，以及 server_task::tokens
+                    
+                    // slot.prompt.n_tokens()：当前消费指针
+                    // 检查当前 prompt 处理进度，如果当前的内容是 media chunk 占位符
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
+                        
+                        // 走 process_chunk
+                        
+                        // slot.prompt.tokens.pos_next()：表示当前 media chunk 的的起始 pos id
                         int32_t res = input_tokens.process_chunk(ctx, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
@@ -2625,6 +2651,7 @@ private:
                             continue;
                         }
 
+                        // 跳过该 media chunk 对应的 n_tokens_out 个占位符 LLAMA_TOKEN_NULL
                         slot.n_prompt_tokens_processed += n_tokens_out;
 
                         // add the image chunk to cache
@@ -2641,9 +2668,10 @@ private:
                     // 如果 prompt 还有没处理的 token，并且 batch 还能放，就继续塞文本 token
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
                         // get next token to process
+                        // 取当前还没处理的下一个 token / 占位符
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
 
-                        // 如果遇到 media 占位符，则 break
+                        // 如果是 media 占位符，则 break
                         if (cur_tok == LLAMA_TOKEN_NULL) {
                             break; // end of text chunk
                         }
@@ -2660,11 +2688,14 @@ private:
                         // 把文本 token 放进 batch
                         common_batch_add(batch,
                             cur_tok,
-                            slot.prompt.tokens.pos_next(),
+                            slot.prompt.tokens.pos_next(),  // 计算当前取的 token 的正确 pos id
                             { slot.id },
                             slot.task->need_embd());
-                        slot.prompt.tokens.push_back(cur_tok);
 
+                        // slot.prompt.tokens 记录该 token 已被处理
+                        slot.prompt.tokens.push_back(cur_tok);
+                        
+                        // 已经处理的元素（token id 或占位符） + 1
                         slot.n_prompt_tokens_processed++;
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
@@ -2693,7 +2724,7 @@ private:
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
 
                     // entire prompt has been processed
-                    /*当整个 prompt 都已经处理完
+                    /*如果整个 prompt 都已经处理完
                         -> slot 状态变成 DONE_PROMPT
                         -> 只要求最后一个 prompt token 输出 logits
                         -> 记录最后一个 token 在 batch 里的位置
@@ -2717,10 +2748,15 @@ private:
                     
                     // 如果整个 prompt 没处理完，例如处理 text token 突然遇到了 media token 占位符然后 break 了
                     else {
+                        // 如果已处理 token 数 slot.prompt.n_tokens() + n_ubatch > prompt 总 token 数
+                        // 即说明“处理进度已经接近 prompt 末尾了”
                         if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
                             // near the end of the prompt
                             do_checkpoint = do_checkpoint && true;
-                        } else {
+                        } 
+                        
+                        // 如果不是“处理进度接近 prompt 末尾”
+                        else {
                             // only do non-end checkpoints if the "checkpoint every n tokens" option is set
                             do_checkpoint = do_checkpoint && params_base.checkpoint_every_nt > 0;
 
@@ -2730,8 +2766,9 @@ private:
                                     last_checkpoint = slot.prompt.checkpoints.back().n_tokens;
                                 }
 
+                                // 判断距离上次 checkpoint 是否已经足够远
                                 do_checkpoint = do_checkpoint && slot.prompt.n_tokens() - batch.n_tokens - last_checkpoint >= params_base.checkpoint_every_nt;
-
+                                // 打印 prompt 处理进度
                                 if (do_checkpoint) {
                                     SLT_INF(slot, "%d tokens since last checkpoint at %d, creating new checkpoint during processing at position %d\n", params_base.checkpoint_every_nt, last_checkpoint, slot.prompt.n_tokens());
                                 }
@@ -2803,18 +2840,18 @@ private:
         // 处理创建的 token batch
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
-
+                
             llama_batch batch_view = {
                 n_tokens,
                 batch.token    + i,
-                nullptr,
+                nullptr,                // embd=nullptr，走 token id 路径
                 batch.pos      + i,
                 batch.n_seq_id + i,
                 batch.seq_id   + i,
                 batch.logits   + i,
             };
 
-            // 进入真正的 decode
+            // batch 进入 llm decode
             const int ret = llama_decode(ctx, batch_view);
 
             metrics.on_decoded(slots);
@@ -3908,8 +3945,9 @@ void server_routes::init_routes() {
         /* handle_completions_impl() 函数负责：
                 1）内部处理 prompt 成 server tokens
                 2）构建 server task，包含 server tokens、task 的参数等信息
-                3）将 server task 加入任务队列等待执行
-                4）读取执行结果队列内的结果，将结果通过流式或非流式输出
+                3）将 server task 加入任务队列 queue tasks
+                4）唤醒 server 主循环（主循环不断取任务、分配任务给 slot、调用 update_slots() 函数处理任务）
+                5）读取执行结果队列内的结果，将结果通过流式或非流式输出
         */
         return handle_completions_impl(
             req,                            // chat 的 http 请求

@@ -3114,6 +3114,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     };
 
     // set input pixel values
+    // 处理 image
     if (!imgs.is_audio) {
         size_t nelem = 0;
         for (const auto & img : imgs.entries) {
@@ -3164,6 +3165,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     }
 
     // set input per projector
+    // 设置 projector
     switch (ctx->model.proj_type) {
         case PROJECTOR_TYPE_MINICPMV:
             {
@@ -3594,6 +3596,8 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
 
     // sanity check (only support batch size of 1 for now)
     const int n_tokens_out = embeddings->ne[1];
+
+    // 校验预算的 token 数和写死的逻辑是否一致
     const int expected_n_tokens_out = clip_n_output_tokens(ctx, imgs.entries[0].get());
     if (n_tokens_out != expected_n_tokens_out) {
         LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
@@ -3606,6 +3610,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     }
 
     // Debug: dump final embeddings if MTMD_DEBUG_EMBEDDINGS is set
+    // 若 debug_output_embeddings=true，则输出最终的嵌入信息
     if (ctx->debug_output_embeddings) {
         const int64_t n_embd = embeddings->ne[0];
         const int64_t n_tokens = embeddings->ne[1];

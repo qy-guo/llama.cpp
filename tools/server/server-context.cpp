@@ -631,7 +631,7 @@ struct server_metrics {
 //
 
 struct server_context_impl {
-    friend struct server_context;
+    friend struct server_context;   // server_context 可以访问 private、protect
 
 public:
     // only use these pointers outside of this class:
@@ -2117,17 +2117,21 @@ private:
         }
     }
 
-    /*update_slots()
-    -> 发现还有 slot 在生成
-    -> 往 queue_tasks 里塞一个 NEXT_RESPONSE
-    -> 主循环下一轮取到 NEXT_RESPONSE
-    -> process_single_task 对它什么也不做
-    -> 队列又空了
-    -> callback_update_slots()
-    -> 再次 update_slots()
-    */
+    
     void update_slots() {
+        /*update_slots() 每被调用一次，就把所有正在处理的 slot 往前推进一点（prefill 或 decode）
+            -> 发现还有 slot 在生成
+            -> 往 queue_tasks 里塞一个 NEXT_RESPONSE
+            -> 主循环下一轮取到 NEXT_RESPONSE
+            -> process_single_task 对它什么也不做
+            -> 队列又空了
+            -> callback_update_slots()
+            -> 再次 update_slots()
+        */
+
         // check if all slots are idle
+        // 步骤1
+        // 检查是否所有 slot.state 都是空闲的，如果是，直接返回
         {
             bool all_idle = true;
 
@@ -2145,6 +2149,10 @@ private:
             }
         }
 
+        // 步骤2
+        // 如果还有 slot 正在处理，先往 queue_tasks 中添加一个 SERVER_TASK_TYPE_NEXT_RESPONSE 类型任务
+        // 这个任务本质上什么也不做，他的作用是让 server_queue::start_loop() 不要睡眠
+        // 下一轮继续调用 update_slots()
         {
             SRV_DBG("%s", "posting NEXT_RESPONSE\n");
 
@@ -2155,22 +2163,44 @@ private:
 
         // apply context-shift if needed
         // TODO: simplify and improve
+        
+        // 步骤3
+        // 对快满的 generation slot 做 context shift，非多模态模式下默认关闭、多模态模式下强制关闭
+        /*  
+            context shift：kv cache 上下文窗口快满时，删除一段旧上下文，然后把后面的 KV cache 位置往前移动
+            如果手动开启 context shift，llama.cpp 默认的策略是：
+                context 已满（保存了 n_ctx 个 token 的 kv cache），如果未指定从哪里开始删、删多少，
+                则从原始 prompt(slot.task.tokens() 个 token) 之后开始删，默认删除 (n_ctx - slot.task.tokens()) / 2
+        */
         for (server_slot & slot : slots) {
+            
+            // 如果 slot 在生成中（已经完成 prefill）、且再生成一个 token 就会碰到上下文上限
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+                
+                // 检查是否开启了 context shift（多余的检查）
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
                     send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
-                    slot.release();
+                    slot.release();     // 释放当前 slot
                     continue;
                 }
 
+                // 如果加载了多模态 context，会禁用 context shift
+                /* 从原理上来说，这是因为一个 image chunk 可能会对应多个 token，
+                    更准确地说，在 server 的 token 序列里，image chunk 是一段 LLAMA_TOKEN_NULL 占位符，
+                    而在主模型 KV cache 里，它对应一批 image embedding decode 后产生的 KV。
+                    如果随便平移位置，很容易把 image chunk 的 token 边界、M-RoPE position、KV cache 对应关系弄乱
+                */ 
                 if (mctx) {
                     // we should never reach this because params_base.ctx_shift is automatically disabled if mmproj is loaded
                     // we don't support ctx_shift because an image chunk may contains multiple tokens
                     GGML_ABORT("not supported by multimodal");
                 }
 
+                // 如果 task 属于 parent / child 任务，n_cmpl 可能 > 1，禁用 context shift
+                // 即一个请求可能生成多个 completion，server 会有 parent task 和 child task，共享 prompt 状态
+                // context shift 会修改 KV cache 和 prompt token 账本；共享 prompt 的多个 slot 之间做这个操作会变复杂
                 if (slot.task->is_parent() || slot.task->is_child()) {
                     send_error(slot, "context shift cannot be used for shared prompt", ERROR_TYPE_SERVER);
                     slot.release();
@@ -2178,28 +2208,45 @@ private:
                 }
 
                 // Shift context
+
+                // n_keep 表示 context shift 时保留开头多少个 token
+                // 如果用户未指定，默认保留整个原始 prompt
                 int n_keep = slot.task->params.n_keep < 0 ? slot.task->n_tokens() : slot.task->params.n_keep;
 
                 if (add_bos_token) {
-                    n_keep += 1;
+                    n_keep += 1;    // BOS token
                 }
 
-                n_keep = std::min(slot.n_ctx - 4, n_keep);
-
+                n_keep = std::min(slot.n_ctx - 4, n_keep);  // n_keep 不能超过 n_ctx - 4
+                
+                // 剩余的 token 数
+                // 当前全部 token 数 - 开头必须保留的 token 数 = 可以考虑丢弃或平移的 token 数
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
+
+                // 丢弃的 token 数
+                // 如果用户未指定，丢弃 n_left 的一半
                 const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
+
+                // 删除当前 slot 中 [n_keep, n_keep + n_discard) 位置的 kv cache
                 llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
+
+
+                // 将 [n_keep + discard, slot.prompt.n_tokens()] 位置（删除区间之后的所有 token）的 kv cache 整体向前移动
                 llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
+                
+                // 更新 slot.prompt.tokens，与 kv cache 一致
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
                 {
                     GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
-
+                    
                     llama_tokens new_tokens = slot.prompt.tokens.get_tokens(); // copy
+
+                    // 把删除区间之后的 token 移动到删除区间的位置上
                     for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
                         new_tokens[i - n_discard] = new_tokens[i];
                     }
@@ -2207,76 +2254,108 @@ private:
                     new_tokens.resize(slot.prompt.tokens.size() - n_discard);
 
                     slot.prompt.tokens.clear();
-                    slot.prompt.tokens.insert(new_tokens);
+                    slot.prompt.tokens.insert(new_tokens);  // 更新 slot.prompt.tokens
                 }
 
-                slot.truncated = true;
+                slot.truncated = true;  // 标记当前 slot 的上下文被截断过
             }
         }
 
+        
+        // 步骤4
+        // 清空上一轮的 this->batch 内容
         // start populating the batch for this iteration
         common_batch_clear(batch);
 
         // track if given slot can be batched with slots already in the batch
+        // 创建 slot_batched，用于记录当前 batch 的代表 slot，判断其他 slot 能不能和它混在同一个 batch 里
         server_slot * slot_batched = nullptr;
 
+
+        // lambda 函数判断某个 special token 是否被保留
+        // 当满足以下任一条件时，返回 true
+        // 1）params_base.special = true
+        // 2）当前的 special token 在 params.sampling.preserved_tokens 里
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+
+        // 步骤5
+        // 先处理 decode 阶段的 slot，把生成序列的 sampled token 放进 batch（这一步只加入上一次采样的 token，还没进行 decode）
         // first, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
+            // 只处理处于 decode 阶段的 slot
             if (slot.state != SLOT_STATE_GENERATING) {
                 continue;
             }
 
             // check if we can batch this slot with the previous one
+            // 如果 slot_batched 为 nullptr，将当前 slot 作为 batch 的代表
             if (!slot_batched) {
                 slot_batched = &slot;
-            } else if (!slot_batched->can_batch_with(slot)) {
+            } 
+            
+            // 如果当前 slot 能否加入 batch（需要和 batch 的代表 slot task 相同且 lora 配置相同）
+            else if (!slot_batched->can_batch_with(slot)) {
                 continue;
             }
-
+            
+            //把 slot 上一次采样的 token 加入到 batch 和 slot.prompt.tokens 账本
             slot.update_batch(batch);
         }
 
         // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx);
-        int32_t n_ubatch = llama_n_ubatch(ctx);
+        int32_t n_batch  = llama_n_batch(ctx);  // 逻辑 batch 上限
+        int32_t n_ubatch = llama_n_ubatch(ctx); // 物理 batch 上限，用于判断 prompt 是否能拆分、以及 checkpoint 相关逻辑
 
-        float  alora_scale       = -1.0f;
-        size_t alora_disabled_id = 0;
 
+        float  alora_scale       = -1.0f;   // 表示还没有临时禁用 alora，禁用时取 0
+        size_t alora_disabled_id = 0;       // 记录禁用的是哪个 lora adapter
+
+
+        // 步骤6
+        // 处理 prefill 阶段的 slot
         // next, batch any pending prompts without exceeding n_batch
+
+        /* 如果满足任一条件，继续把还没 prefill 完的 prompt token 塞进 batch
+            1）cont_batching == true：（默认为 true）允许一边处理已有请求的 decode，一边把新请求的 prompt 加进来
+            2）batch.n_tokens == 0：当前 batch 还没有任何 token
+        */
         if (params_base.cont_batching || batch.n_tokens == 0) {
             // 遍历所有正在处理的 slot
             for (auto & slot : slots) {
+                // 跳过空闲的 lost
                 if (!slot.is_processing()) {
                     continue;
                 }
 
                 // check if we can batch this slot with the previous one
+                // 如果当前 slot 和 batch 代表的 slot 不兼容，则跳过
                 if (slot_batched && !slot_batched->can_batch_with(slot)) {
                     continue;
                 }
 
                 // check if this is a child slot
+                // 跳过等待 parent slot 的 child slot
                 if (slot.state == SLOT_STATE_WAIT_OTHER) {
                     SLT_DBG(slot, "%s", "waiting for parent slot to complete\n");
                     continue;
                 }
 
+                
+                // prefill 阶段
+
                 // this slot still has a prompt to be processed
-                // 只处理这 2 种状态的 slot：
+                // 只处理这 2 种状态的 slot（prefill）：
                 //  1）slot 刚开始处理
                 //  2）slot 正在处理
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
-                    // 读取目标输入
-                    const auto & input_tokens = slot.task->tokens;
+                    const auto & input_tokens = slot.task->tokens;  // 完整的目标输入
 
                     // used to determine the number of tokens added to the batch for the current slot
-                    const auto n_tokens_prev = batch.n_tokens;
+                    const auto n_tokens_prev = batch.n_tokens;      // 当前 batch 里的 token 数
 
                     // TODO: maybe move branch to outside of this loop in the future
                     // 如果是 1）slot 刚开始处理
@@ -2304,9 +2383,10 @@ private:
                         }*/
 
                         // keep track how many tokens we can reuse from the previous state
-                        int n_past = 0;
+                        int n_past = 0;     // 可以从旧 kv cache 复用的前缀 token 数
 
                         // empty prompt passed -> release the slot and send empty response
+                        // 如果传入的 prompt 为空，释放 slot 并跳过
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
 
@@ -2318,13 +2398,16 @@ private:
                         }
 
                         // TODO: support memory-less logits computation
+                        // 如果当前 slot.task 需要 logits，但当前 llama_context 没有 memory 模块，则释放 slot 并跳过
                         if (slot.task->need_logits() && !llama_get_memory(ctx)) {
                             send_error(slot, "the current context does not logits computation. skipping", ERROR_TYPE_SERVER);
                             slot.release();
                             continue;
                         }
 
+                        // 如果当前 slot 的 prompt 不能拆分成多轮处理（completion/chat 通常不需要 embedding 输出，可以 split）
                         if (!slot.can_split()) {
+                            // 如果 task 的完整输入 token 数 > 物理 batch 上限，则释放 slot 并跳过
                             if (slot.task->n_tokens() > n_ubatch) {
                                 send_error(slot,
                                            string_format(
@@ -2336,6 +2419,7 @@ private:
                                 continue;
                             }
 
+                            // 如果 task 的完整输入 token 数 > slot 的 context 长度，则释放 slot 并跳过
                             if (slot.task->n_tokens() > slot.n_ctx) {
                                 send_error(
                                     slot,
@@ -2346,7 +2430,12 @@ private:
                                 slot.release();
                                 continue;
                             }
-                        } else {
+                        } 
+                        
+                        // 如果当前 slot 的 prompt 能拆分成多轮处理（chat/completion 通常走此路径）
+                        else {
+                            // 如果 task 的完整输入 token 数 >= slot 的 context 长度，则释放 slot 并跳过
+                            // 这里有“=”，是因为可 split 的 completion 类任务后面还要至少留一点空间生成 token
                             if (slot.task->n_tokens() >= slot.n_ctx) {
                                 send_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
@@ -2357,32 +2446,74 @@ private:
                                 continue;
                             }
 
+
                             // 如果允许 prompt cache，会计算新 prompt 和旧 prompt 的公共前缀、复用 cache
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
+                                
+                                // 记录有多少个与旧 prompt 相同的前缀
+                                /*
+                                    具体比较逻辑为：
+                                    1）token id：          直接比较 token id
+                                    2）media chunk 占位符： 取出对应的 media chunk，比较 chunk id 和占用的 token 数
+                                */
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
                                 // if there is an alora invoked, don't cache after the invocation start
+                                /*  
+                                    如果 prompt 里有 aLoRA invocation token，那么 cache 不允许越过 invocation 起点
+                                    因为 invocation 前后 LoRA 是否启用不同的 kv 不同，不能混用
+                                */
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
 
-                                const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // kv 平移复用，非多模态模式下默认关闭、多模态模式下强制关闭
+                                /*  如果旧prompt和新prompt不但有相同前缀，而且在前缀后面也出现了一大段连续相同token，
+                                    就尝试把旧KV cache中那段token的KV平移到新位置，避免重新prefill
+
+                                    示例：
+                                        旧 prompt: A B X C D E F
+                                        新 prompt: A B Y C D E F
+                                    
+                                        假设 params.n_cache_reuse = 4，会将：
+                                            1）旧 prompt 中非相同前缀之后的
+                                            2）连续相同 token 数 >= 4 的，
+                                        连续 token 向前平移
+
+                                    即  旧 prompt: A B X C D E F 的 kv cache 逻辑变成
+                                                    ↓
+                                        旧 prompt: A B C D E F ，“D E F” 向前平移到相同前缀“A B C”后
+                                    
+                                    注意：
+                                        旧 prompt 平移后的非相同前缀的 kv cache 与新 prompt 并不是完全等价的，
+                                        因为旧 prompt “C D E F” 的 kv cache 是考虑了 “X” token 的
+                                */
+                                // 
+                                const auto n_cache_reuse = slot.task->params.n_cache_reuse; // 多模态时强制为 0
+
+                                // 当同时满足时 can_cache_reuse = true，允许使用 kv 平移复用：
+                                //  1）当前 memory 支持 shift
+                                //  2）旧 prompt 为非多模态时
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx)) &&
                                     !slot.prompt.tokens.has_mtmd;
 
+                                // 如果不允许 kv 平移复用且 n_cache_reuse > 0，报错
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
                                 }
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
+                                // 如果允许 kv 平移复用且 n_cache_reuse > 0（必须是非多模态且手动设置 n_cache_reuse > 0）
                                 if (can_cache_reuse && n_cache_reuse > 0) {
                                     GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
 
+                                    // 旧 cache prompt 的扫描位置，从相同前缀的下一个位置开始
                                     size_t head_c = n_past; // cache
+                                    // 新 prompt 的扫描位置，从相同前缀的下一个位置开始
                                     size_t head_p = n_past; // current prompt
 
                                     if (mctx) {
@@ -2392,16 +2523,20 @@ private:
 
                                     SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 
+                                    // 在旧 prompt 和新 prompt 还没扫描完时继续
                                     while (head_c < slot.prompt.tokens.size() &&
                                            head_p < input_tokens.size()) {
 
                                         size_t n_match = 0;
+
+                                        // 从 head_c 和 head_p 开始，数一段连续相同 token 的长度
                                         while (head_c + n_match < slot.prompt.tokens.size() &&
                                                head_p + n_match < input_tokens.size()       &&
                                                slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
                                             n_match++;
                                         }
 
+                                        // 如果连续相同的 token 长度 >= n_cache_reuse，满足复用最短阈值，移动对应 token 和 kv cache
                                         if (n_match >= (size_t) n_cache_reuse) {
                                             SLT_INF(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
                                             //for (size_t i = head_p; i < head_p + n_match; i++) {
@@ -2409,13 +2544,15 @@ private:
                                             //}
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
-
+                                            
+                                            // 产出 slot 中旧的 kv、前移可以复用的 kv
                                             llama_memory_seq_rm (llama_get_memory(ctx), slot.id, head_p, head_c);
                                             llama_memory_seq_add(llama_get_memory(ctx), slot.id, head_c, head_c + n_match, kv_shift);
 
+                                            // 同步更新 slot.prompt.tokens 账本
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
-                                                n_past++;
+                                                n_past++;   // 相同前缀增加（平移了 token 过来）
                                             }
 
                                             head_c += n_match;
@@ -2427,21 +2564,43 @@ private:
 
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
                                 }
-                            } else {
+                            } 
+                            
+                            // 如果不允许 prompt cache，相同前缀长度 = 0
+                            else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
-                                n_past = 0;
+                                n_past = 0; //
                             }
 
+                            // 计算已经复用了 n_past 个 token / 占位符后，下一个要处理的 token / 占位符的 pos id 是多少
+                            // 此时的 n_past = 相同前缀 token 数 + 平移过来的 token 数
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // note: when n_swa == 0, the model does not use SWA
-                            const auto n_swa = std::max(0, llama_model_n_swa(model));
+                            const auto n_swa = std::max(0, llama_model_n_swa(model));   // sliding window attention
 
                             // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa);
+                            const auto pos_min_thold = std::max(0, pos_next - n_swa);   // swa 所需要的 kv cache 的起始 pos id
 
+
+                            // 当复用了旧 prompt（n_past > 0）但不是完全复用旧 prompt 时
                             if (n_past > 0 && n_past < slot.prompt.n_tokens()) {
+                                
+                                /*
+                                    pos_min 表示当前 slot 在 kv memory 里还保留的最小 position：
+                                        1）普通全量 KV cache 情况下，保存所有 token 的 kv cache，pos_min 通常是 0
+                                        2）SWA 或部分 memory 情况下，旧的早期 KV 可能已经在 windows 外，pos_min 可能大于 0
+                                    例如：
+                                        普通全量 KV:
+                                            memory 里有 pos 0,1,2,3,...,100
+                                            pos_min = 0
+                                        SWA / partial memory:
+                                            memory 里可能只有 pos 80,81,82,...,100
+                                            pos_min = 80
+                                */ 
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
+                                
+                                // pos_min == -1 报错
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
                                     GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
@@ -2449,6 +2608,7 @@ private:
 
                                 // when the prompt prefix does not match, print the tokens around the mismatch
                                 // this is useful for debugging prompt caching
+                                // debug 输出
                                 if (slots_debug) {
                                     const int np0 = std::max<int>(n_past - 4, 0);
                                     const int np1 = std::min<int>(n_past + 6, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
@@ -2490,6 +2650,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
+                                // 如果 memory 存在的最小 pos
                                 if (pos_min >= pos_min_thold) {
                                     SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
 
@@ -2537,7 +2698,7 @@ private:
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
-                                        SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
+                                       SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -2562,7 +2723,7 @@ private:
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream && slot.task->params.return_progress) {
-                            send_partial_response(slot, {}, true);
+                             send_partial_response(slot, {}, true);
                         }
                     }
 
@@ -2724,7 +2885,7 @@ private:
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
 
                     // entire prompt has been processed
-                    /*如果整个 prompt 都已经处理完
+                    /*如果整个 prompt 都已经处理完，准备开始 decode 阶段
                         -> slot 状态变成 DONE_PROMPT
                         -> 只要求最后一个 prompt token 输出 logits
                         -> 记录最后一个 token 在 batch 里的位置
@@ -2834,10 +2995,13 @@ private:
             n_empty_consecutive = 0;
         }
 
+
+        // 步骤 7
+        // 调用 llama_decode() 处理 text token batch
+
         int32_t i_next = 0;
 
         // process the created batch of tokens
-        // 处理创建的 token batch
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
                 
@@ -2946,7 +3110,9 @@ private:
                     continue; // continue loop of slots
                 }
 
+                // 如果 slot 的状态为 SLOT_STATE_DONE_PROMPT
                 if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                    // embedding  task
                     if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                         // prompt evaluated for embedding
                         send_embedding(slot, batch_view);
@@ -2955,6 +3121,7 @@ private:
                         continue; // continue loop of slots
                     }
 
+                    // rerank rask
                     if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
                         send_rerank(slot, batch_view);
                         slot.release();
@@ -2965,6 +3132,8 @@ private:
                     GGML_ASSERT(slot.task->need_sampling());
 
                     // prompt evaluated for next-token prediction
+                    // decode task
+                    // 将 slota 状态设置为 SLOT_STATE_GENERATING
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {

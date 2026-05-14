@@ -150,7 +150,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     while (true) {
         QUE_DBG("%s", "processing new tasks\n");
 
-        // 第二层 while，不断从 queue_tasks 中取任务
+        // 不断从 queue_tasks 中取任务，交给 callback_new_task()
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running) {
@@ -173,6 +173,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         QUE_DBG("%s", "update slots\n");
 
         // this will run the main inference process for all slots
+        // 队列清空后，调用 callback_update_slots()，也就是 update_slots()，对所有 slot 开启推理主流程
         callback_update_slots();
         {
             // update_slots() may take a while to finish, we need to make sure it's not counted as idle
@@ -182,7 +183,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
 
         QUE_DBG("%s", "waiting for new tasks\n");
 
-        
+        // 如果没有新任务，就 wait_for 等待；有新任务就进入下一轮
         while (true) {
             // 创建锁管理器类型的 lock 对象，自动给 mutex_tasks 加锁和解锁
             // lock 会锁住每一轮 while 循环内的变量的访问，例如 running、queue_tasks

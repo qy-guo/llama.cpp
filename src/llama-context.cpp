@@ -1615,7 +1615,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
-    // 如果需要输入 embedding，则需要输出所有 token 的embedding；
+    // 如果需要输入 embedding（output_all=true），则需要输出所有 token 的embedding；
     // 需要满足输出的 token 数等于总 token 数：n_outputs_all == n_token_all
     if (output_all) {
         // require that all tokens are output
@@ -1629,6 +1629,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     GGML_ASSERT(n_tokens_all <= cparams.n_batch);
 
+    // n_ubatch = llama.cpp 内部一次实际计算最多处理多少 token
+
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
     // 首次 decode 时记录计算起始时间，并累计本次排队的 token 数，供性能统计使用。
@@ -1638,9 +1640,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
-    // embd_seq: 保存按 sequence 聚合后的 embedding 输出
+    // embd_seq: 按 sequence 聚合后的 embedding 输出
     // output_swaps: 如果内部输出顺序和用户 batch 顺序不一致，后面会记录惰性交换信息
-    // 每次新 decode 前都要清空，避免上一次 batch 的残留状态污染本次结果。
+    // 每次新 decode 前都要清空，避免上一次 batch 的残留状态污染本次结果
     embd_seq.clear();
     output_swaps.clear();
 

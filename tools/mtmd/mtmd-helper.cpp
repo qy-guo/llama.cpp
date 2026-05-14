@@ -256,13 +256,15 @@ int32_t mtmd_helper_decode_image_chunk(
 
     // 获取 model、mmproj 维度、pos 维度信息
     const llama_model * model = llama_get_model(lctx);
-    int n_mmproj_embd = llama_model_n_embd_inp(model);
+    int n_mmproj_embd = llama_model_n_embd_inp(model);          // mmproj 的输出维度，Qwen3.5-0.8B 为 1024
     int n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;    // M-RoPE 是 4 维，其他是 1 维
 
-    // 获取 chunk 的 token 数、chunk 对应所需的 batch 数
-    int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
-    int32_t i_batch = 0;
-    int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
+
+    int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);    // media chunk 对应的 token 数
+    int32_t i_batch = 0;                                        // batch 索引
+    int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch; // media chunk 需要被拆分成几个 batch
+
+    // 构造一个 decode_embd_batch
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
 
     // 如果使用 M-RoPE 位置编码
@@ -307,16 +309,27 @@ int32_t mtmd_helper_decode_image_chunk(
         // TODO @ngxson : need to make sure only one image is processed at a time, and n_ubatch must be enough to hold the image
     }
 
+    // 遍历每个 i_batch
     while (i_batch < n_img_batches) { // split into batches
+        // 记录当前 batch 在整个 media chunk 的 offset
         int pos_offset = i_batch*n_batch;
+        // 获取当前 batch 内的 token 数
         int n_tokens_batch = std::min(n_batch, n_tokens - pos_offset);
+        
+        // 例如：
+        //      media chunk 对应 token 数为 1000，每个 batch 最大 512，那么，2 轮分别是：
+        //      1）i_batch = 0, pos_offset = 0,     n_tokens_batch = min(512, 1000-0) = 512
+        //      2）i_batch = 1, pos_offset = 512,   n_tokens_batch = min(512, 1000-512) = 488
+
+
+        // 从 batch_embd 中且分出一个 view（即当前 batch），输入到主模型进行 decode
         llama_batch batch_embd_view = batch_embd.get_view(pos_offset, n_tokens_batch);
 
         LOG_INF("decoding %s batch %d/%d, n_tokens_batch = %d\n", name, i_batch+1, n_img_batches, n_tokens_batch);
 
         int64_t t1 = ggml_time_ms();
 
-        // 在主模型中进行 decode
+        // 将切分出来的 batch_embd 输入到主模型中进行 decode
         int32_t ret = llama_decode(lctx, batch_embd_view);
         if (ret != 0) {
             LOG_ERR("failed to decode %s\n", name);
@@ -329,6 +342,7 @@ int32_t mtmd_helper_decode_image_chunk(
         i_batch++;
     }
 
+    // 更新处理该 media chunk 后的 pos id 位置
     n_past += mtmd_input_chunk_get_n_pos(chunk);
     *new_n_past = n_past;
 
@@ -407,7 +421,7 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
 
         // 传入 chunk，路由 image chunk 和 audio chunk 到不同的处理逻辑
         ret = mtmd_encode_chunk(ctx, chunk);
-        
+
         // 如果处理失败，清空 text_batch，返回错误代码
         if (ret != 0) {
             LOG_ERR("failed to encode %s slice\n", name);

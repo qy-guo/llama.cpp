@@ -338,7 +338,7 @@ int main(int argc, char ** argv) {
         }
 
         // this call blocks the main thread until queue_tasks.terminate() is called
-        // 开启主循环
+        // 开启 server 主循环
         ctx_server.start_loop();
 
         clean_up();

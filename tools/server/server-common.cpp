@@ -513,6 +513,7 @@ std::string server_tokens::detokenize(const llama_context * ctx, bool special) c
 size_t server_tokens::get_common_prefix(const server_tokens & b) const {
     const size_t max_idx = std::min(tokens.size(), b.tokens.size());
 
+    // 非多模态情况下，直接比较 token id
     if (!has_mtmd) {
         for (size_t i = 0; i < max_idx; ++i) {
             if (tokens[i] == b.tokens[i]) {
@@ -525,10 +526,13 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
         return max_idx;
     }
 
+    // 多模态情况下
+
     for (size_t i = 0; i < max_idx; ++i) {
         const llama_token ai =   tokens[i];
         const llama_token bi = b.tokens[i];
 
+        // 如果同时遇到 media chunk 占位符，相同前缀必须保证：1）media chunk id相同；2）media chunk 占用的 token 数相同
         if (ai == LLAMA_TOKEN_NULL && bi == LLAMA_TOKEN_NULL) {
             const auto & a_chunk =   find_chunk(i);
             const auto & b_chunk = b.find_chunk(i);
@@ -550,6 +554,7 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
             return i;
         }
 
+        // 如果遇到 token id，直接比较
         if (ai == bi) {
             continue;
         }
@@ -595,6 +600,8 @@ int32_t server_tokens::process_chunk(
     const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
                         ? "image" : "audio";
     SRV_INF("processing %s...\n", name);
+
+    // 获取当前 llama_context 类型上下文 ctx 中允许提交给 llama_decode() 的最大 batch 大小
     int32_t n_batch = llama_n_batch(ctx);
     int64_t t0 = ggml_time_ms();
     llama_pos new_n_past; // unused for now
